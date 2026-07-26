@@ -1,4 +1,4 @@
-Flask==2.3.3
-requests==2.31.0
-feedparser==6.0.10
-beautifulsoup4==4.12.2
+Flask
+requests
+feedparser
+beautifulsoup4
