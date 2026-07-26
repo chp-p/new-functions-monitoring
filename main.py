@@ -188,8 +188,10 @@ def check_feeds():
     for game, url in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(url)
+            log(f"RSS {game}: статус {feed.get('status', 'нет')}, записей: {len(feed.entries)}")
+            
             if not feed.entries:
-                log(f"RSS {game}: пусто")
+                log(f"RSS {game}: пусто. bozo={feed.get('bozo', 0)}")
                 continue
 
             if game not in seen_entries:
@@ -227,3 +229,4 @@ def check():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
