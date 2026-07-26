@@ -10,17 +10,17 @@ from flask import Flask
 
 app = Flask(__name__)
 
-# ====== НАСТРОЙКИ ======
+# ====== НАСТРОЙКИ (все через Render Environment) ======
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "google/gemini-flash-1.5"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
+# Вебхуки тоже из переменных окружения
 WEBHOOKS = {
-    "rust": "https://discord.com/api/webhooks/1530915163325075467/s0hhJdWkYb4eGEhfPF7GPYEpsFGTLXD5rjiwdFq8eMsHF8ndf_NRMbwaIvqkxOkCdjy4",
-    "garrysmod": "https://discord.com/api/webhooks/1530915445224378398/3J8-YM7OjeqxaUJaL1LJobQD9O0KnZjj8h-PjP4IYTIjUQXkXRQwtOhJTisZ52jQUSEk",
-    "unturned": "https://discord.com/api/webhooks/1530915598844825620/tMPKR9KZvEKCyGNyXDbQEmshF5xzs_MS5WbnTn6bwC6QkNBALY9sFLAZmeJP4SmuOPBN",
-    "sbox": "https://discord.com/api/webhooks/1530916231870156903/Vn_-MQHI9kMk1qTpXYbE7z4qItcRQA9uaXJMGxZV_2ad-iai7g6YDPdq6JhzrQZWMowq"
+    "rust": os.environ.get("WEBHOOK_RUST", ""),
+    "garrysmod": os.environ.get("WEBHOOK_GMOD", ""),
+    "unturned": os.environ.get("WEBHOOK_UNTURNED", ""),
+    "sbox": os.environ.get("WEBHOOK_SBOX", "")
 }
 
 RSS_FEEDS = {
@@ -37,39 +37,34 @@ GAME_NAMES = {
     "sbox": "s&box"
 }
 
+# ====== ЛОГИ ======
+
+def log(msg):
+    print(msg, flush=True)
+    sys.stdout.flush()
+
+
 # ====== AI АНАЛИЗ ПАТЧА ======
 
 SYSTEM_PROMPT = """Ты — анализатор патч-ноутов для игр (Rust, Garry's Mod, Unturned, s&box).
-Твоя задача: прочитать патч-ноут и выделить ТОЛЬКО новые функции и изменения.
-Пропускай косметику, благотворительные скины без геймплейных изменений, мелкие фиксы багов, общие слова.
+Выдели ТОЛЬКО новые функции и изменения геймплея.
 
-Верни ТОЛЬКО JSON без markdown-обёртки:
+Верни ТОЛЬКО JSON:
 
 {
-  "main_emoji": "один эмодзи, подходящий под главную тему патча",
+  "main_emoji": "эмодзи",
   "sections": [
     {
-      "emoji": "эмодзи раздела",
+      "emoji": "эмодзи",
       "title": "Название раздела",
-      "items": ["конкретный пункт", "конкретный пункт"]
+      "items": ["пункт 1", "пункт 2"]
     }
   ],
   "nothing_new": false
 }
 
-Если патч не содержит НИКАКИХ новых функций, предметов, оружия, транспорта, изменений карты, API или геймплея — верни {"nothing_new": true, "reason": "краткая причина"}.
-
-Правила:
-- Разделы создавай ТОЛЬКО под то, что реально есть в патче.
-- Названия разделов адаптируй под содержимое.
-- Пункты должны быть конкретными.
-- Пиши на русском языке.
-- Уложись в 1800 символов."""
-
-
-def log(msg):
-    print(msg, flush=True)
-    sys.stdout.flush()
+Если нет новых функций — {"nothing_new": true, "reason": "причина"}.
+Пиши на русском. Создавай разделы только под то, что есть в патче."""
 
 
 def clean_html(text):
@@ -85,38 +80,40 @@ def analyze_patch(title, raw_text):
     if len(text) > 8000:
         text = text[:8000] + "..."
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": SYSTEM_PROMPT},
+                {"text": f"Заголовок: {title}\n\nПатч-ноут:\n{text}"}
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 1500
+        }
     }
 
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Заголовок: {title}\n\nТекст патч-ноута:\n{text}"}
-        ],
-        "max_tokens": 1500,
-        "temperature": 0.3
-    }
+    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
 
     try:
-        log(f"AI: запрос к OpenRouter...")
-        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
+        log("AI: запрос к Gemini...")
+        r = requests.post(url, json=payload, timeout=30)
         log(f"AI: статус {r.status_code}")
 
         if r.status_code != 200:
             log(f"AI: ошибка {r.status_code} - {r.text[:300]}")
             return None
 
-        response_text = r.json()["choices"][0]["message"]["content"]
-        log(f"AI: ответ получен ({len(response_text)} символов)")
+        data = r.json()
+        response_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        log(f"AI: ответ ({len(response_text)} символов)")
 
+        # Чистим markdown
         response_text = re.sub(r'^```(?:json)?\s*\n?', '', response_text)
         response_text = re.sub(r'\n?```\s*$', '', response_text)
 
         result = json.loads(response_text)
-        log(f"AI: разбор успешен, секций: {len(result.get('sections', []))}")
+        log(f"AI: секций: {len(result.get('sections', []))}")
         return result
 
     except Exception as e:
@@ -136,14 +133,14 @@ def format_message(game, title, link, raw_text):
         return (
             f"## 📦 Обновление: **{title}**\n\n"
             f"⚠️ *Не удалось проанализировать патч.*\n\n"
-            f"📎 [Полный патч-ноут]({link}) | 🎮 {game_name}"
+            f"📎 [Патч-ноут]({link}) | 🎮 {game_name}"
         )
 
     if analysis.get("nothing_new"):
         return (
             f"## ℹ️ Обновление: **{title}**\n\n"
             f"*{analysis.get('reason', 'Без значительных изменений.')}*\n\n"
-            f"📎 [Полный патч-ноут]({link}) | 🎮 {game_name}"
+            f"📎 [Патч-ноут]({link}) | 🎮 {game_name}"
         )
 
     main_emoji = analysis.get("main_emoji", "📦")
@@ -161,7 +158,7 @@ def format_message(game, title, link, raw_text):
         for item in items[:8]:
             message += f"🔹 {item}\n"
 
-    message += f"\n📎 [Полный патч-ноут]({link}) | 🎮 {game_name}"
+    message += f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name}"
 
     if len(message) > 1950:
         message = message[:1920] + "\n\n...\n📎 " + link
@@ -180,7 +177,8 @@ def get_entry_hash(entry):
 
 
 def send_to_discord(game, title, link, raw_text):
-    if game not in WEBHOOKS:
+    if game not in WEBHOOKS or not WEBHOOKS[game]:
+        log(f"DISCORD: нет вебхука для {game}")
         return
 
     log(f"DISCORD: отправка в {game}...")
@@ -194,7 +192,7 @@ def send_to_discord(game, title, link, raw_text):
         else:
             log(f"DISCORD error {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        log(f"DISCORD send error: {e}")
+        log(f"DISCORD error: {e}")
 
 
 def check_feeds():
