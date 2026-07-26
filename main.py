@@ -41,7 +41,6 @@ GAME_NAMES = {
     "warthunder": "War Thunder"
 }
 
-# Кеш во временной папке (сбрасывается при перезапуске)
 CACHE_FILE = "/tmp/processed_news.txt"
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
@@ -66,7 +65,7 @@ def mark_processed(game, title):
     except Exception as e:
         log(f"Ошибка записи в кеш: {e}")
 
-# ---------- ПАРСИНГ СТАТЕЙ (с изображениями) ----------
+# ---------- ПАРСИНГ СТАТЕЙ (исправлен для Steam) ----------
 def fetch_full_article(url, game=None):
     try:
         log(f"Загрузка статьи: {url}")
@@ -79,42 +78,51 @@ def fetch_full_article(url, game=None):
             tag.decompose()
 
         content = None
-        if game == "rust" or "facepunch.com" in url:
+        
+        # --- ОСНОВНАЯ СТРАТЕГИЯ ---
+        if "facepunch.com" in url:
             content = soup.find("div", class_="blog")
-        elif game == "warthunder" or "warthunder.com" in url:
+            if not content:
+                content = soup.find("div", class_="post-content")
+                
+        elif "warthunder.com" in url:
             content = soup.find("div", class_="news-text")
             if not content:
                 content = soup.find("div", class_="content")
+                
         elif "steampowered.com" in url:
+            # Steam: ищем announce_body (содержит реальный контент)
             content = soup.find("div", class_="announcement_body")
             if not content:
-                content = soup.find("div", class_="news_post")
+                # Альтернативный класс
+                content = soup.find("div", class_="news_post_content")
+            if not content:
+                # Ищем любой div с большим текстом (>2000 символов)
+                divs = soup.find_all("div")
+                for div in divs:
+                    text_len = len(div.get_text(strip=True))
+                    if text_len > 2000:
+                        content = div
+                        break
         else:
-            content = soup.find("div", class_="blog")
-            if not content:
-                content = soup.find("div", class_="news-section-block")
-            if not content:
-                content = soup.find("article")
+            # Универсальный поиск
+            content = soup.find("article")
             if not content:
                 content = soup.find("main")
             if not content:
-                divs = soup.find_all("div")
-                for div in divs:
-                    if len(div.get_text(strip=True)) > 1000:
-                        content = div
-                        break
+                content = soup.find("div", class_="content")
 
         if content:
             text = content.get_text(separator="\n", strip=True)
+            log(f"Извлечено из контейнера: {len(text)} символов")
         else:
             text = soup.get_text(separator="\n", strip=True)
+            log("Контейнер не найден, взят весь HTML")
 
         text = re.sub(r'\s+', ' ', text).strip()
         log(f"Загружено символов: {len(text)}")
-        if len(text) < 100:
-            log(f"Предупреждение: короткий текст. Фрагмент: {text[:200]}")
-
-        # --- Извлечение изображений (только для War Thunder) ---
+        
+        # --- ИЗВЛЕЧЕНИЕ ИЗОБРАЖЕНИЙ (War Thunder) ---
         image_urls = []
         if game == "warthunder":
             img_tags = soup.find_all("img")
@@ -166,22 +174,28 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов комп�
 
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА ----------
+# ---------- ОТПРАВКА ЗАПРОСА (увеличенные задержки) ----------
 def send_request(payload):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
-    for attempt in range(3):
+    # Увеличиваем количество попыток и задержки
+    for attempt in range(5):
         try:
             r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
             if r.status_code == 429:
-                wait = 2 ** attempt
+                wait = 2 ** (attempt + 1)  # 2, 4, 8, 16, 32 секунды
                 log(f"Превышен лимит, ждём {wait}с...")
                 time.sleep(wait)
                 continue
             if r.status_code != 200:
                 log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
+                # Если модель недоступна, пробуем запасную
+                if "model" in r.text and "unavailable" in r.text:
+                    log("Пробуем запасную модель: qwen/qwen-2.5-72b-instruct:free")
+                    payload["model"] = "qwen/qwen-2.5-72b-instruct:free"
+                    continue
                 return None
             response_text = r.json()["choices"][0]["message"]["content"]
             log(f"Получен ответ модели (символов: {len(response_text)})")
@@ -195,7 +209,7 @@ def send_request(payload):
             return json.loads(json_str)
         except Exception as e:
             log(f"Попытка {attempt+1} ошибка: {e}")
-            time.sleep(1)
+            time.sleep(2 ** attempt)
     return None
 
 def has_identifiers(analysis):
@@ -241,7 +255,7 @@ def analyze_with_qwen(full_text):
             return result2 if result2 else result
     return None
 
-# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD ----------
+# ---------- ФОРМАТИРОВАНИЕ ----------
 def format_message(game, title, link, raw_text):
     game_name = GAME_NAMES.get(game, game)
     version_match = re.search(r'(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)', title)
@@ -333,7 +347,7 @@ def send_to_discord(game, title, link, raw_text):
                 log(f"Ошибка Discord {r.status_code}: {r.text[:200]}")
         except Exception as e:
             log(f"Ошибка отправки в Discord: {e}")
-        time.sleep(1)
+        time.sleep(2)  # увеличил задержку между сообщениями
 
     if image_urls and game == "warthunder":
         log(f"Отправка {len(image_urls)} изображений для {game}")
@@ -383,6 +397,7 @@ def check_feeds():
             if not feed.entries:
                 log(f"Нет записей в {game}")
                 continue
+            # Берём только самую свежую запись
             entry = feed.entries[0]
             if is_old(entry.get("published_parsed")):
                 log(f"Новость старая: {entry.get('title')}")
