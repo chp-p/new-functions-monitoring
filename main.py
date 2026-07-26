@@ -113,7 +113,7 @@ def analyze_patch_full(text):
         sections = call_groq(chunk)
         if sections:
             all_sections.extend(sections)
-        time.sleep(5)
+        time.sleep(30)  # Увеличенная пауза
 
     merged = {}
     for sec in all_sections:
