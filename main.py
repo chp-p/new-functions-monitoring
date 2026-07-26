@@ -16,7 +16,7 @@ app = Flask(__name__)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Используем рабочую бесплатную модель
+# Рабочая бесплатная модель (по состоянию на июль 2026)
 MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 WEBHOOKS = {
@@ -73,8 +73,7 @@ def fetch_full_article(url):
         for tag in soup(["script", "style"]):
             tag.decompose()
         
-        # Ищем основной контент. Для Rust используется class="post-content"
-        # для других игр можно расширить список
+        # Ищем основной контент по нескольким возможным классам
         content = None
         for class_name in ["post-content", "news-content", "article-content", "content", "body"]:
             content = soup.find("div", class_=re.compile(class_name))
@@ -84,7 +83,6 @@ def fetch_full_article(url):
         if content:
             text = content.get_text(separator="\n", strip=True)
         else:
-            # Если не нашли div, берем весь body
             body = soup.find("body")
             if body:
                 text = body.get_text(separator="\n", strip=True)
@@ -94,54 +92,41 @@ def fetch_full_article(url):
         # Очищаем лишние пробелы
         text = re.sub(r'\s+', ' ', text).strip()
         log(f"Загружено символов: {len(text)}")
-        # Возвращаем первые 50000 символов (можно увеличить)
+        # Возвращаем до 50000 символов (можно увеличить)
         return text[:50000]
     except Exception as e:
         log(f"Ошибка загрузки статьи: {e}")
         return ""
 
-# ---------- НОВЫЙ УСИЛЕННЫЙ СИСТЕМНЫЙ ПРОМПТ ----------
-SYSTEM_PROMPT = """Ты — анализатор патч-ноутов компьютерных игр. Твоя задача — извлечь все изменения из предоставленного текста и представить их в виде структурированного JSON-объекта на русском языке.
+# ---------- НОВЫЙ СИСТЕМНЫЙ ПРОМПТ С АКЦЕНТОМ НА ТЕХНИЧЕСКИЕ ИДЕНТИФИКАТОРЫ ----------
+SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из текста и представь в виде JSON на русском языке.
 
-КРИТИЧЕСКИ ВАЖНО: для каждого изменения, если в тексте упоминаются конкретные технические идентификаторы (команды, консольные команды, хуки, префабы, методы, классы, переменные, названия предметов, файлов и т.п.), ты ОБЯЗАН указать их в круглых скобках сразу после описания изменения.
+КРИТИЧЕСКИ ВАЖНО: в тексте есть технические термины. Ты ОБЯЗАН найти и вытащить их все!
 
-Форматы идентификаторов:
-- (команда: точная_команда)
-- (хук: точный_хук)
-- (префаб: полный_путь_к_префабу)
-- (метод: Класс.Метод)
-- (предмет: название_предмета)
-- (консольная команда: команда)
-- (переменная: имя_переменной)
-- (класс: имя_класса)
+Ищи и вытаскивай:
+- ConVars (консольные переменные) — например: "ConVars to tweak this"
+- команды (commands) — например: "cinematic_stop commands", "client.playerseed command"
+- префабы (prefabs) — например: "PrefabAttribute"
+- хуки (hooks)
+- методы (methods)
+- классы (classes)
+- переменные (variables)
 
-НЕ ВЫДУМЫВАЙ идентификаторы! Если в тексте нет точного имени, не пиши его. Но если точное имя есть, ты ДОЛЖЕН его включить.
+Пример того, как должны выглядеть пункты с идентификаторами (ЭТИ ПРИМЕРЫ ВЗЯТЫ ИЗ ЭТОГО ЖЕ ТЕКСТА):
+"Добавлены ConVars для настройки окон рейдов (консольная переменная: ConVars)"
+"Удалена консольная переменная client.SetPlayerSeed (переменная: client.SetPlayerSeed)"
+"Исправлены команды cinematic_play и cinematic_stop (команда: cinematic_play, команда: cinematic_stop)"
+"Оптимизированы скрипты для оружейных стоек с использованием PrefabAttribute (префаб: PrefabAttribute)"
 
-Пример правильного ответа:
-"Добавлен новый монумент Apartment Complex (префаб: assets/bundled/prefabs/autospawn/monument/apartment_complex.prefab, команда: rentroom)"
-"Введена команда для быстрого перемещения (консольная команда: tp, метод: TeleportManager.Teleport)"
+Если в тексте есть технические термины — ты ОБЯЗАН их вытащить и указать в скобках.
+НЕ ВЫДУМЫВАЙ! Если точного названия нет в тексте — не пиши его.
 
-Структура JSON:
-{
-  "main_emoji": "эмодзи для общего заголовка",
-  "sections": [
-    {
-      "emoji": "эмодзи для раздела",
-      "title": "Название раздела на русском",
-      "items": [
-        "описание изменения с идентификаторами (если есть)",
-        "другой пункт"
-      ]
-    }
-  ],
-  "nothing_new": false
-}
+Формат JSON:
+{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Название раздела","items":["пункт 1 (идентификаторы)","пункт 2"]}],"nothing_new":false}
 
-Если изменений нет, верни: {"nothing_new": true, "reason": "причина на русском"}
+ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА."""
 
-ОТВЕТ ДОЛЖЕН БЫТЬ ТОЛЬКО JSON, БЕЗ ЛИШНИХ ПОЯСНЕНИЙ."""
-
-# ---------- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ОТПРАВКИ ЗАПРОСА ----------
+# ---------- ФУНКЦИЯ ОТПРАВКИ ЗАПРОСА С ПОВТОРНЫМИ ПОПЫТКАМИ И ЛОГИРОВАНИЕМ ----------
 def send_request(payload):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -159,12 +144,17 @@ def send_request(payload):
                 log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
                 return None
             response_text = r.json()["choices"][0]["message"]["content"]
-            log(f"Ответ модели: {response_text[:200]}...")
+            
+            # Логируем полный ответ для отладки
+            log(f"ПОЛНЫЙ ОТВЕТ МОДЕЛИ:\n{response_text}")
+            
+            # Извлекаем JSON из ответа
             match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if not match:
                 log("Не найден JSON в ответе модели")
                 return None
             json_str = match.group(0)
+            # Убираем возможные Markdown-обрамления
             json_str = re.sub(r'^```(?:json)?\s*\n?', '', json_str, flags=re.MULTILINE)
             json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
             return json.loads(json_str)
@@ -181,15 +171,16 @@ def has_identifiers(analysis):
                 return True
     return False
 
-# ---------- ОСНОВНАЯ ФУНКЦИЯ АНАЛИЗА (с повторным запросом) ----------
+# ---------- ОСНОВНАЯ ФУНКЦИЯ АНАЛИЗА (с повторным запросом при отсутствии идентификаторов) ----------
 def analyze_with_qwen(full_text):
     if not OPENROUTER_API_KEY:
         log("Нет API-ключа")
         return None
 
-    # Первый запрос
-    user_prompt = f"""Проанализируй патч-ноут и ВЕРНИ ОТВЕТ ТОЛЬКО В ФОРМАТЕ JSON.
-ОБЯЗАТЕЛЬНО укажи все технические идентификаторы (команды, хуки, префабы, методы, переменные, классы), которые встречаются в тексте.
+    # Первый запрос с явным перечислением того, что искать
+    user_prompt = f"""Проанализируй патч-ноут. В тексте есть технические термины: ConVars, команды, префабы, хуки, методы, классы, переменные.
+ВЫТАЩИ ИХ ВСЕ и укажи в скобках после каждого пункта.
+
 Патч-ноут:
 {full_text}"""
 
@@ -199,7 +190,7 @@ def analyze_with_qwen(full_text):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt}
         ],
-        "max_tokens": 6000,
+        "max_tokens": 8000,   # увеличено для детального ответа
         "temperature": 0.1
     }
 
@@ -210,8 +201,8 @@ def analyze_with_qwen(full_text):
             return result
         else:
             log("Идентификаторы не найдены, отправляем повторный запрос с требованием")
-            user_prompt2 = f"""Ты не указал технические идентификаторы! Перечитай текст и ВЫТАЩИ ВСЕ КОМАНДЫ, ХУКИ, ПРЕФАБЫ, МЕТОДЫ, ПЕРЕМЕННЫЕ, КЛАССЫ, которые там есть. 
-Они должны быть в скобках после каждого пункта.
+            user_prompt2 = f"""Ты не вытащил технические термины! В тексте есть ConVars, команды, префабы, хуки, методы, классы, переменные. 
+Найди их и укажи в скобках.
 Патч-ноут:
 {full_text}"""
             payload["messages"][1]["content"] = user_prompt2
@@ -321,6 +312,7 @@ def check_feeds():
             if not feed.entries:
                 log(f"Нет записей в {game}")
                 continue
+            # Берём только самую свежую запись
             entry = feed.entries[0]
             if is_old(entry.get("published_parsed")):
                 log(f"Новость старая: {entry.get('title')}")
