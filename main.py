@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama-3.1-8b-instant"
+MODEL = "mixtral-8x7b-32768"
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
