@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "openai/gpt-oss-120b"
+MODEL = "llama-3.1-8b-instant"
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
@@ -41,7 +41,11 @@ def log(msg):
     print(msg, flush=True)
     sys.stdout.flush()
 
-SYSTEM_PROMPT = "Ты анализатор патчей. Извлеки изменения. JSON: {\"sections\":[{\"emoji\":\"\",\"title\":\"\",\"items\":[\"пункт (идентификаторы)\"]}]}. Ничего не придумывай."
+SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из этого фрагмента.
+Для каждого пункта укажи ВСЕ технические идентификаторы в скобках через запятую:
+(команда: ...), (хук: ...), (префаб: ...), (метод: ...), (предмет: ...), (консольная команда: ...), (переменная: ...), (класс: ...).
+Верни ТОЛЬКО JSON: {"sections":[{"emoji":"эмодзи","title":"Раздел","items":["пункт (идентификаторы)"]}]}.
+Если нет изменений: {"sections":[]}. Пиши на русском, не сокращай."""
 
 def clean_html(text):
     text = re.sub(r'<br\s*/?>', '\n', text)
@@ -72,9 +76,9 @@ def call_groq(text_chunk):
         "model": MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Фрагмент патча:\n{text_chunk}"}
+            {"role": "user", "content": f"Фрагмент патч-ноута:\n{text_chunk}"}
         ],
-        "max_tokens": 300,
+        "max_tokens": 2000,
         "temperature": 0.3
     }
     try:
@@ -98,20 +102,19 @@ def call_groq(text_chunk):
         return None
 
 def analyze_patch_full(text):
-    # Разбиваем на очень маленькие чанки (~400 символов)
-    chunk_size = 400
+    chunk_size = 1500
     chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    log(f"Разбито на {len(chunks)} частей")
+    chunks = chunks[:4]  # анализируем максимум 4 чанка (6000 символов)
+    log(f"Чанков для анализа: {len(chunks)}")
 
     all_sections = []
     for i, chunk in enumerate(chunks):
-        log(f"Анализ части {i+1}/{len(chunks)}...")
+        log(f"Анализ чанка {i+1}/{len(chunks)}...")
         sections = call_groq(chunk)
         if sections:
             all_sections.extend(sections)
-        time.sleep(8)  # Большая пауза
+        time.sleep(5)
 
-    # Объединяем разделы
     merged = {}
     for sec in all_sections:
         title = sec.get("title", "Прочее")
@@ -129,7 +132,7 @@ def analyze_patch(title, raw_text, link=""):
     if not full_text:
         return None
 
-    sections = analyze_patch_full(full_text[:6000])  # Берем не более 6000 символов
+    sections = analyze_patch_full(full_text)
     if not sections:
         return {"main_emoji": "📦", "sections": [], "nothing_new": False}
 
@@ -145,7 +148,7 @@ def format_message(game, title, link, raw_text):
     if analysis is None:
         return None
     if analysis.get("nothing_new") or len(analysis.get("sections", [])) == 0:
-        return []  # Пусто — не шлём
+        return []
 
     main_emoji = analysis.get("main_emoji", "📦")
     title_line = f"{main_emoji} Обновление: **{title}**"
