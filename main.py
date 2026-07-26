@@ -56,7 +56,7 @@ def mark_processed(game, title):
     with open(CACHE_FILE, "a", encoding="utf-8") as f:
         f.write(f"{game}|{title}\n")
 
-# ---------- ПАРСИНГ СТАТЕЙ ----------
+# ---------- УЛУЧШЕННЫЙ ПАРСИНГ СТАТЕЙ ----------
 def fetch_full_article(url):
     try:
         log(f"Загрузка статьи: {url}")
@@ -95,35 +95,48 @@ def fetch_full_article(url):
         log(f"Ошибка загрузки статьи: {e}")
         return ""
 
-# ---------- СИСТЕМНЫЙ ПРОМПТ ----------
-SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из текста и представь в виде JSON на русском языке.
+# ---------- СИСТЕМНЫЙ ПРОМПТ (СТРОГО РУССКИЙ) ----------
+SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из текста и представь их в виде JSON на РУССКОМ языке.
 
-КРИТИЧЕСКИ ВАЖНО: в тексте есть технические термины. Ты ОБЯЗАН найти и вытащить их все!
+КРИТИЧЕСКИ ВАЖНО: ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ВСЕ ЗАГОЛОВКИ РАЗДЕЛОВ, ПУНКТЫ И ИДЕНТИФИКАТОРЫ ДОЛЖНЫ БЫТЬ НА РУССКОМ.
 
-Ищи и вытаскивай:
-- ConVars (консольные переменные)
-- команды (commands)
-- переменные (variables)
-- префабы (prefabs)
-- хуки (hooks)
-- методы (methods)
-- классы (classes)
+В тексте есть технические термины (ConVars, команды, переменные, префабы, хуки, методы, классы). Ты ОБЯЗАН найти их все и указать в круглых скобках после каждого пункта.
 
-ВОТ КОНКРЕТНЫЕ ПРИМЕРЫ ИЗ ЭТОГО ПАТЧ-НОУТА (ты должен найти их в тексте):
-1. "Server Owners have been given a bunch of ConVars to tweak this" → (консольная переменная: ConVars)
-2. "Remove client.SetPlayerSeed convar" → (переменная: client.SetPlayerSeed)
-3. "Fixed some issues with cinematic_play and cinematic_stop commands" → (команда: cinematic_play, команда: cinematic_stop)
-4. "duplicate of client.playerseed command" → (команда: client.playerseed)
+Форматы идентификаторов (на русском):
+- (консольная переменная: имя)
+- (команда: имя)
+- (переменная: имя)
+- (префаб: путь)
+- (хук: имя)
+- (метод: Класс.Метод)
+- (класс: имя)
 
-Если в тексте есть технические термины — ты ОБЯЗАН их вытащить и указать в скобках.
-НЕ ВЫДУМЫВАЙ! Если точного названия нет в тексте — не пиши его.
+Примеры правильных пунктов на РУССКОМ:
+"Добавлены ConVars для настройки окон рейдов (консольная переменная: ConVars)"
+"Удалена консольная переменная client.SetPlayerSeed (переменная: client.SetPlayerSeed)"
+"Исправлены команды cinematic_play и cinematic_stop (команда: cinematic_play, команда: cinematic_stop)"
+
+НЕ ВЫДУМЫВАЙ идентификаторы! Если точного названия нет в тексте — не пиши его.
 
 Формат JSON:
-{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Название раздела","items":["пункт 1 (идентификаторы)","пункт 2"]}],"nothing_new":false}
+{
+  "main_emoji": "эмодзи",
+  "sections": [
+    {
+      "emoji": "эмодзи",
+      "title": "Название раздела на русском",
+      "items": ["пункт 1 на русском (идентификаторы)", "пункт 2"]
+    }
+  ],
+  "nothing_new": false
+}
 
-ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА."""
+Если изменений нет:
+{"nothing_new": true, "reason": "причина на русском"}
 
-# ---------- ОТПРАВКА ЗАПРОСА (без логирования полного ответа) ----------
+ОТВЕТ ДОЛЖЕН БЫТЬ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, И ВСЁ НА РУССКОМ ЯЗЫКЕ."""
+
+# ---------- ОТПРАВКА ЗАПРОСА (без полного логирования ответа) ----------
 def send_request(payload):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -141,7 +154,6 @@ def send_request(payload):
                 log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
                 return None
             response_text = r.json()["choices"][0]["message"]["content"]
-            # Логируем только длину ответа, чтобы не засорять логи
             log(f"Получен ответ модели (символов: {len(response_text)})")
             match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if not match:
@@ -163,14 +175,14 @@ def has_identifiers(analysis):
                 return True
     return False
 
-# ---------- АНАЛИЗ ----------
+# ---------- АНАЛИЗ (ЗАПРОС НА РУССКОМ) ----------
 def analyze_with_qwen(full_text):
     if not OPENROUTER_API_KEY:
         log("Нет API-ключа")
         return None
 
-    user_prompt = f"""Проанализируй патч-ноут. В тексте есть технические термины: ConVars, команды, префабы, хуки, методы, классы, переменные.
-ВЫТАЩИ ИХ ВСЕ и укажи в скобках после каждого пункта.
+    user_prompt = f"""Проанализируй этот патч-ноут. В тексте есть технические термины: ConVars, команды, префабы, хуки, методы, классы, переменные.
+ВЫТАЩИ ИХ ВСЕ и укажи в скобках после каждого пункта. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ.
 
 Патч-ноут:
 {full_text}"""
@@ -191,8 +203,8 @@ def analyze_with_qwen(full_text):
             log("Идентификаторы найдены.")
             return result
         else:
-            log("Идентификаторы не найдены, повторный запрос")
-            user_prompt2 = f"""Ты не вытащил технические термины! Найди и укажи в скобках.
+            log("Идентификаторы не найдены, повторный запрос с требованием")
+            user_prompt2 = f"""Ты не вытащил технические термины! Найди их и укажи в скобках. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ.
 Патч-ноут:
 {full_text}"""
             payload["messages"][1]["content"] = user_prompt2
@@ -200,7 +212,7 @@ def analyze_with_qwen(full_text):
             return result2 if result2 else result
     return None
 
-# ---------- ФОРМАТИРОВАНИЕ (улучшенная разбивка) ----------
+# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD ----------
 def format_message(game, title, link, raw_text):
     game_name = GAME_NAMES.get(game, game)
     version_match = re.search(r'(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)', title)
@@ -232,7 +244,7 @@ def format_message(game, title, link, raw_text):
     messages = []
     current = f"## {title_line}\n"
     part = 1
-    max_len = 1900  # чуть меньше лимита Discord (2000)
+    max_len = 1900
 
     for section in analysis.get("sections", []):
         emoji = section.get("emoji", "🔹")
@@ -241,26 +253,19 @@ def format_message(game, title, link, raw_text):
         if not items:
             continue
         block = f"\n### {emoji} {section_title}:\n"
-        # Формируем блок из пунктов
         item_lines = []
         for item in items[:10]:
             item_lines.append(f"🔹 {item}")
-        # Если блок не влезает в текущее сообщение, отправляем его отдельно
         if len(current + block + "\n".join(item_lines)) > max_len:
-            # Закрываем текущее сообщение
             current += f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name} (часть {part})"
             messages.append(current)
             part += 1
-            # Начинаем новое сообщение с заголовка
             current = f"## {title_line} (часть {part})\n"
-        # Добавляем блок и пункты
         current += block + "\n".join(item_lines) + "\n"
 
-    # Добавляем ссылку в конец последнего сообщения
     footer = f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name}"
     if part > 1:
         footer += f" (часть {part})"
-    # Проверяем, влезет ли футер в текущее сообщение
     if len(current + footer) > max_len:
         messages.append(current)
         current = footer
@@ -270,7 +275,6 @@ def format_message(game, title, link, raw_text):
 
     return messages
 
-# ---------- ОТПРАВКА В DISCORD ----------
 def send_to_discord(game, title, link, raw_text):
     webhook = WEBHOOKS.get(game)
     if not webhook:
@@ -290,7 +294,7 @@ def send_to_discord(game, title, link, raw_text):
 
     for msg in messages:
         if len(msg) > 2000:
-            log(f"Предупреждение: сообщение длиной {len(msg)} символов, может не отправиться")
+            log(f"Предупреждение: длина сообщения {len(msg)} > 2000")
         payload = {"content": msg, "allowed_mentions": {"parse": []}}
         try:
             r = requests.post(webhook, json=payload)
