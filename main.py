@@ -41,19 +41,30 @@ def log(msg):
     sys.stdout.flush()
 
 SYSTEM_PROMPT = """Ты — анализатор патч-ноутов для игр (Rust, Garry's Mod, Unturned, s&box).
-Выдели ВСЕ технические изменения: новые методы API, хуки, консольные команды, префабы, изменения в системе строительства, электричестве, транспорте, оружии.
+Выдели ВСЕ технические изменения: новые методы API, хуки, консольные команды, префабы, предметы, изменения в системе строительства, электричестве, транспорте, оружии.
 
-ВАЖНО: Для каждого изменения указывай ТОЧНОЕ название команды/метода/хука/префаба в скобках.
+ВАЖНО: Для каждого изменения перечисляй ВСЕ возможные технические идентификаторы через запятую в скобках.
+Форматы:
+- (команда: название)
+- (хук: название)
+- (префаб: путь)
+- (метод: название)
+- (предмет: название)
+- (консольная команда: название)
+- (переменная: название)
+- (класс: название)
+
 Примеры:
-- "Добавлена возможность отправлять UI-разметку (команда: SendMarkupMessage)"
-- "Новый хук для спавна вертолёта (хук: OnHelicopterSpawn)"
-- "Добавлен префаб для нового монумента (префаб: assets/bundled/prefabs/autospawn/monument/arctic_base.prefab)"
-- "Новая консольная команда (команда: killall)"
+- "Добавлена возможность отправлять UI (команда: SendMarkupMessage, метод: BasePlayer.SendMarkupMessage)"
+- "Новый монумент (префаб: assets/..., команда: spawn monument)"
+- "Ускоренная прогрессия (консольная команда: sv_accelerated_progression, переменная: ConVar.Server.accelerated)"
+
+Если не знаешь точный тип — напиши все возможные варианты.
 
 Верни ТОЛЬКО JSON:
-{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Раздел","items":["конкретный пункт с названиями в скобках"]}],"nothing_new":false}
+{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Раздел","items":["пункт (все идентификаторы)"]}],"nothing_new":false}
 Если нет изменений: {"nothing_new":true,"reason":"причина"}.
-Пиши на русском. Будь технически точен."""
+Пиши на русском. Будь технически точен. Максимум 10 пунктов на раздел."""
 
 def clean_html(text):
     text = re.sub(r'<br\s*/?>', '\n', text)
@@ -75,7 +86,7 @@ def fetch_full_article(url):
             text = re.sub(r'<[^>]+>', ' ', text)
             text = re.sub(r'\s+', ' ', text)
             log(f"FETCH: получено {len(text)} символов")
-            return text.strip()[:5000]
+            return text.strip()[:8000]
     except Exception as e:
         log(f"FETCH error: {e}")
     return ""
@@ -86,7 +97,7 @@ def analyze_patch(title, raw_text, link=""):
         full_text = fetch_full_article(link)
     
     if full_text:
-        text = full_text[:5000]
+        text = full_text[:8000]
     else:
         text = clean_html(raw_text)[:4000]
 
@@ -97,13 +108,13 @@ def analyze_patch(title, raw_text, link=""):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Заголовок: {title}\n\n{text}"}
         ],
-        "max_tokens": 1000,
+        "max_tokens": 4096,
         "temperature": 0.3
     }
     
     try:
         log("AI: запрос к Groq...")
-        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
+        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=90)
         log(f"AI: статус {r.status_code}")
         if r.status_code != 200:
             log(f"AI: ошибка - {r.text[:300]}")
@@ -127,40 +138,43 @@ def format_message(game, title, link, raw_text):
     analysis = analyze_patch(title, raw_text, link)
     
     if analysis is None:
-        return (
-            f"## 📦 Обновление: **{title}**\n\n"
-            f"⚠️ *Не удалось проанализировать патч.*\n\n"
-            f"📎 [Патч-ноут]({link}) | 🎮 {game_name}"
-        )
+        return [f"## 📦 Обновление: **{title}**\n\n⚠️ *Не удалось проанализировать патч.*\n\n📎 [Патч-ноут]({link}) | 🎮 {game_name}"]
     
     if analysis.get("nothing_new"):
-        return (
-            f"## ℹ️ Обновление: **{title}**\n\n"
-            f"*{analysis.get('reason', 'Без значительных изменений.')}*\n\n"
-            f"📎 [Патч-ноут]({link}) | 🎮 {game_name}"
-        )
+        return [f"## ℹ️ Обновление: **{title}**\n\n*{analysis.get('reason', 'Без значительных изменений.')}*\n\n📎 [Патч-ноут]({link}) | 🎮 {game_name}"]
     
     main_emoji = analysis.get("main_emoji", "📦")
     title_line = f"{main_emoji} Обновление: **{title}**"
     if version:
         title_line += f" — `{version}`"
     
-    message = f"## {title_line}\n"
+    messages = []
+    current = f"## {title_line}\n"
+    part = 1
     
     for section in analysis.get("sections", []):
         emoji = section.get("emoji", "🔹")
         section_title = section.get("title", "Изменения")
         items = section.get("items", [])
-        message += f"\n### {emoji} {section_title}:\n"
-        for item in items[:8]:
-            message += f"🔹 {item}\n"
+        
+        block = f"\n### {emoji} {section_title}:\n"
+        for item in items[:12]:
+            block += f"🔹 {item}\n"
+        
+        if len(current + block) > 1900:
+            current += f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name} (часть {part})"
+            messages.append(current)
+            part += 1
+            current = f"## {title_line} (часть {part})\n"
+        
+        current += block
     
-    message += f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name}"
+    current += f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name}"
+    if part > 1:
+        current += f" (часть {part})"
+    messages.append(current)
     
-    if len(message) > 1950:
-        message = message[:1920] + "\n\n...\n📎 " + link
-    
-    return message
+    return messages
 
 seen_entries = {}
 
@@ -172,16 +186,18 @@ def send_to_discord(game, title, link, raw_text):
         return
     log(f"DISCORD: отправка в {game}...")
     time.sleep(15)
-    content = format_message(game, title, link, raw_text)
-    payload = {"content": content, "allowed_mentions": {"parse": []}}
-    try:
-        r = requests.post(WEBHOOKS[game], json=payload)
-        if r.status_code == 204:
-            log(f"DISCORD OK {game}: {title}")
-        else:
-            log(f"DISCORD error {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        log(f"DISCORD error: {e}")
+    messages = format_message(game, title, link, raw_text)
+    for msg in messages:
+        payload = {"content": msg, "allowed_mentions": {"parse": []}}
+        try:
+            r = requests.post(WEBHOOKS[game], json=payload)
+            if r.status_code == 204:
+                log(f"DISCORD OK {game}: {title}")
+            else:
+                log(f"DISCORD error {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            log(f"DISCORD error: {e}")
+        time.sleep(2)
 
 def check_feeds():
     log("CHECK: начинаю проверку RSS")
