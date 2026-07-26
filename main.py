@@ -10,7 +10,6 @@ import feedparser
 from flask import Flask
 from bs4 import BeautifulSoup
 import threading
-from collections import deque
 
 app = Flask(__name__)
 
@@ -18,7 +17,7 @@ app = Flask(__name__)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Для каждой игры своя модель (бесплатные, рабочие на июль 2026)
+# Модели для каждой игры (исправлены на рабочие бесплатные)
 MODELS = {
     "rust": "nvidia/nemotron-3-ultra-550b-a55b:free",
     "garrysmod": "nvidia/nemotron-3-super-120b-a12b:free",
@@ -40,7 +39,7 @@ RSS_FEEDS = {
     "garrysmod": "https://store.steampowered.com/feeds/news/app/4000/",
     "unturned": "https://store.steampowered.com/feeds/news/app/304930/",
     "sbox": "https://sbox.facepunch.com/news/rss",
-    "warthunder": "https://warthunder.com/en/rss/news/"
+    "warthunder": "https://warthunder.com/en/rss/news/"   # официальный RSS
 }
 
 GAME_NAMES = {
@@ -53,28 +52,23 @@ GAME_NAMES = {
 
 CACHE_FILE = "/tmp/processed_news.txt"
 
-# ---------- РЕАЛИЗАЦИЯ ОГРАНИЧИТЕЛЯ ЧАСТОТЫ (20 RPM) ----------
+# ---------- УЛУЧШЕННЫЙ ОГРАНИЧИТЕЛЬ ЧАСТОТЫ (не более 1 запроса в 3 секунды) ----------
 class RateLimiter:
-    def __init__(self, max_requests=20, period=60):
-        self.max_requests = max_requests
-        self.period = period
-        self.timestamps = deque()
+    def __init__(self, requests_per_minute=20):
+        self.interval = 60.0 / requests_per_minute  # ≈ 3 секунды
+        self.last_request_time = 0
         self.lock = threading.Lock()
 
     def wait_if_needed(self):
         with self.lock:
             now = time.time()
-            # Удаляем записи старше period
-            while self.timestamps and now - self.timestamps[0] > self.period:
-                self.timestamps.popleft()
-            if len(self.timestamps) >= self.max_requests:
-                sleep_time = self.period - (now - self.timestamps[0]) + 0.1
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                    now = time.time()
-            self.timestamps.append(now)
+            elapsed = now - self.last_request_time
+            if elapsed < self.interval:
+                sleep_time = self.interval - elapsed
+                time.sleep(sleep_time)
+            self.last_request_time = time.time()
 
-rate_limiter = RateLimiter(max_requests=20, period=60)
+rate_limiter = RateLimiter(requests_per_minute=20)
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def log(msg):
@@ -98,7 +92,7 @@ def mark_processed(game, title):
     except Exception as e:
         log(f"Ошибка записи в кеш: {e}")
 
-# ---------- ПАРСИНГ СТАТЕЙ (с изображениями) ----------
+# ---------- ПАРСИНГ СТАТЕЙ (с извлечением изображений для War Thunder) ----------
 def fetch_full_article(url, game=None):
     try:
         log(f"Загрузка статьи: {url}")
@@ -190,7 +184,7 @@ def send_request(payload, model):
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
-    payload["model"] = model  # используем переданную модель
+    payload["model"] = model
     
     for attempt in range(3):
         try:
@@ -333,7 +327,7 @@ def send_to_discord(game, title, link, raw_text):
         log(f"Новость уже обработана: {title}")
         return
 
-    model = MODELS.get(game, "nvidia/nemotron-3-ultra-550b-a55b:free")  # модель по умолчанию
+    model = MODELS.get(game, "nvidia/nemotron-3-ultra-550b-a55b:free")
     text_messages, image_urls = format_message(game, title, link, raw_text, model)
     if not text_messages:
         log(f"Нет сообщений для отправки ({title})")
@@ -400,7 +394,17 @@ def process_game(game, url):
         feed = feedparser.parse(url)
         if not feed.entries:
             log(f"Нет записей в {game}")
-            return
+            # Для War Thunder попробуем альтернативный URL, если RSS пуст
+            if game == "warthunder":
+                # Возможно, нужно использовать другой RSS-адрес
+                alt_url = "https://warthunder.com/en/news/rss/"
+                log(f"Попытка альтернативного RSS для War Thunder: {alt_url}")
+                feed = feedparser.parse(alt_url)
+                if not feed.entries:
+                    log(f"Альтернативный RSS для War Thunder тоже пуст")
+                    return
+            else:
+                return
         entry = feed.entries[0]
         if is_old(entry.get("published_parsed")):
             log(f"Новость старая: {entry.get('title')}")
