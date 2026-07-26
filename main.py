@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 import hashlib
 import re
@@ -66,6 +67,11 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов для и
 - Уложись в 1800 символов."""
 
 
+def log(msg):
+    print(msg, flush=True)
+    sys.stdout.flush()
+
+
 def clean_html(text):
     text = re.sub(r'<br\s*/?>', '\n', text)
     text = re.sub(r'</p>', '\n', text)
@@ -95,26 +101,26 @@ def analyze_patch(title, raw_text):
     }
 
     try:
-        print(f"AI: запрос для '{title[:50]}...'")
+        log(f"AI: запрос к OpenRouter...")
         r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
-        print(f"AI: статус {r.status_code}")
+        log(f"AI: статус {r.status_code}")
 
         if r.status_code != 200:
-            print(f"AI: ошибка {r.status_code} - {r.text[:300]}")
+            log(f"AI: ошибка {r.status_code} - {r.text[:300]}")
             return None
 
         response_text = r.json()["choices"][0]["message"]["content"]
-        print(f"AI: ответ получен ({len(response_text)} символов)")
+        log(f"AI: ответ получен ({len(response_text)} символов)")
 
         response_text = re.sub(r'^```(?:json)?\s*\n?', '', response_text)
         response_text = re.sub(r'\n?```\s*$', '', response_text)
 
         result = json.loads(response_text)
-        print(f"AI: разбор успешен, секций: {len(result.get('sections', []))}")
+        log(f"AI: разбор успешен, секций: {len(result.get('sections', []))}")
         return result
 
     except Exception as e:
-        print(f"AI error: {e}")
+        log(f"AI error: {e}")
         return None
 
 
@@ -177,44 +183,47 @@ def send_to_discord(game, title, link, raw_text):
     if game not in WEBHOOKS:
         return
 
+    log(f"DISCORD: отправка в {game}...")
     content = format_message(game, title, link, raw_text)
     payload = {"content": content, "allowed_mentions": {"parse": []}}
 
     try:
         r = requests.post(WEBHOOKS[game], json=payload)
         if r.status_code == 204:
-            print(f"DISCORD OK {game}: {title}")
+            log(f"DISCORD OK {game}: {title}")
         else:
-            print(f"DISCORD error {r.status_code}: {r.text[:200]}")
+            log(f"DISCORD error {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print(f"DISCORD send error: {e}")
+        log(f"DISCORD send error: {e}")
 
 
 def check_feeds():
+    log("CHECK: начинаю проверку RSS")
     for game, url in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(url)
             if not feed.entries:
-                print(f"RSS {game}: пусто")
+                log(f"RSS {game}: пусто")
                 continue
 
             if game not in seen_entries:
                 seen_entries[game] = set()
-                print(f"RSS {game}: первый запуск, {len(feed.entries)} записей")
+                log(f"RSS {game}: первый запуск, {len(feed.entries)} записей")
 
             for entry in feed.entries[:3]:
                 h = get_entry_hash(entry)
                 title = entry.get("title", "Без названия")
                 if h not in seen_entries[game]:
                     seen_entries[game].add(h)
-                    print(f"RSS НОВОЕ {game}: {title}")
+                    log(f"RSS НОВОЕ {game}: {title}")
                     link = entry.get("link", "")
                     raw = entry.get("summary", entry.get("description", ""))
                     send_to_discord(game, title, link, raw)
                 else:
-                    print(f"RSS ПРОПУСК {game}: {title}")
+                    log(f"RSS ПРОПУСК {game}: {title}")
         except Exception as e:
-            print(f"RSS error {game}: {e}")
+            log(f"RSS error {game}: {e}")
+    log("CHECK: завершено")
 
 
 @app.route("/")
