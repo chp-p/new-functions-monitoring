@@ -8,12 +8,18 @@ import html
 import json
 import feedparser
 from flask import Flask
+from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
+# ---------- КОНФИГУРАЦИЯ ----------
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "openrouter/free"          # тестируем эту модель
+
+# Модель - автоматический выбор бесплатной модели
+MODEL = "openrouter/free"
+# Если хотите фиксированную модель, раскомментируйте:
+# MODEL = "tencent/hy3:free"
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
@@ -36,114 +42,143 @@ GAME_NAMES = {
     "sbox": "s&box"
 }
 
+CACHE_FILE = "/tmp/processed_news.txt"   # кеш в /tmp (подходит для Render)
+
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def log(msg):
     print(msg, flush=True)
     sys.stdout.flush()
 
-SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из полного текста.
-Для каждого пункта укажи реальные технические идентификаторы в скобках (только если они есть в тексте).
-Форматы:
-- (команда: точная_команда)
-- (хук: точный_хук)
-- (префаб: полный_путь_к_префабу)
-- (метод: Класс.Метод)
-- (предмет: название_предмета)
-- (консольная команда: команда)
-- (переменная: имя_переменной)
-- (класс: имя_класса)
+def is_processed(game, title):
+    if not os.path.exists(CACHE_FILE):
+        return False
+    with open(CACHE_FILE, "r", encoding="utf-8") as f:
+        content = f.read()
+    return f"{game}|{title}" in content
 
-Не выдумывай идентификаторы! Если в тексте нет точного имени, не пиши его.
-Пример хорошего вывода:
-"Добавлен новый монумент Apartment Complex (префаб: assets/bundled/prefabs/autospawn/monument/apartment_complex.prefab, команда: rentroom)"
-"Ускоренная прогрессия (консольная команда: sv_accelerated_progression 2, переменная: ConVar.Server.accelerated_progression)"
-
-Верни ТОЛЬКО JSON:
-{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Раздел","items":["пункт (идентификаторы)"]}],"nothing_new":false}
-Если изменений нет: {"nothing_new":true,"reason":"причина"}"""
+def mark_processed(game, title):
+    with open(CACHE_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{game}|{title}\n")
 
 def clean_html(text):
-    text = re.sub(r'<br\s*/?>', '\n', text)
-    text = re.sub(r'</p>', '\n', text)
-    text = re.sub(r'<[^>]+>', '', text)
-    text = html.unescape(text)
-    return text.strip()
+    soup = BeautifulSoup(text, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    text = soup.get_text(separator="\n")
+    return re.sub(r'\s+', ' ', text).strip()
 
 def fetch_full_article(url):
     try:
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
+            log(f"Ошибка загрузки {url}: {r.status_code}")
             return ""
-        text = r.text
-        content = ""
-        for tag in ['post-content', 'news_content', 'announcement_content']:
-            match = re.search(rf'<div[^>]*class="[^"]*{tag}[^"]*"[^>]*>(.*?)</div>', text, re.DOTALL)
-            if match:
-                content = match.group(1)
-                break
-        if not content:
-            match = re.search(r'<body[^>]*>(.*?)</body>', text, re.DOTALL)
-            content = match.group(1) if match else text
-        content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL|re.IGNORECASE)
-        content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL|re.IGNORECASE)
-        content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL|re.IGNORECASE)
-        content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL|re.IGNORECASE)
-        content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL|re.IGNORECASE)
-        content = re.sub(r'<[^>]+>', ' ', content)
-        content = html.unescape(content)
-        content = re.sub(r'\s+', ' ', content).strip()
-        return content[:12000]   # модель способна принять много текста
+        soup = BeautifulSoup(r.text, "html.parser")
+        content_div = soup.find('div', class_=re.compile(r'(post-content|news_content|announcement_content|body|content)'))
+        if content_div:
+            for tag in content_div(["script", "style"]):
+                tag.decompose()
+            text = content_div.get_text(separator="\n", strip=True)
+        else:
+            body = soup.find('body')
+            if body:
+                for tag in body(["script", "style"]):
+                    tag.decompose()
+                text = body.get_text(separator="\n", strip=True)
+            else:
+                text = clean_html(r.text)
+        return text[:30000]   # ограничим длину
     except Exception as e:
-        log(f"Fetch error: {e}")
+        log(f"Ошибка загрузки статьи: {e}")
         return ""
 
+# ---------- СИСТЕМНЫЙ ПРОМПТ (русский, JSON) ----------
+SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Твоя задача — извлечь все изменения из предоставленного текста и ВСЕГДА отвечать ТОЛЬКО на РУССКОМ языке.
+
+Для каждого пункта укажи реальные технические идентификаторы в скобках (только если они есть в тексте). Не выдумывай идентификаторы!
+
+Пример хорошего вывода на РУССКОМ языке:
+"Добавлен новый монумент Apartment Complex (префаб: assets/bundled/prefabs/autospawn/monument/apartment_complex.prefab, команда: rentroom)"
+
+Твой ответ должен быть только в формате JSON. Никакого другого текста, кроме JSON, быть не должно.
+Формат JSON:
+{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Название раздела на русском","items":["пункт 1 на русском (идентификаторы)","пункт 2 на русском (идентификаторы)"]}],"nothing_new":false}
+Если изменений нет, верни: {"nothing_new":true,"reason":"причина на русском"}"""
+
 def analyze_with_qwen(full_text):
+    """Отправляет текст в OpenRouter и возвращает распарсенный JSON."""
+    if not OPENROUTER_API_KEY:
+        log("API ключ OpenRouter отсутствует")
+        return None
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
+
+    user_prompt = f"""Проанализируй следующий патч-ноут и ВЕРНИ ОТВЕТ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ В ФОРМАТЕ JSON.
+Полный патч-ноут:
+{full_text}"""
+
     payload = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Полный патч-ноут:\n{full_text}"}
+            {"role": "user", "content": user_prompt}
         ],
         "max_tokens": 6000,
-        "temperature": 0.2
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"}   # если модель поддерживает
     }
-    try:
-        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
-        if r.status_code != 200:
-            log(f"OpenRouter error: {r.status_code} {r.text[:300]}")
-            return None
-        response_text = r.json()["choices"][0]["message"]["content"]
-        # Извлекаем JSON
-        match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if not match:
-            log("No JSON in response")
-            return None
-        json_str = match.group(0)
-        json_str = re.sub(r'^```(?:json)?\s*\n?', '', json_str)
-        json_str = re.sub(r'\n?```\s*$', '', json_str)
-        return json.loads(json_str)
-    except Exception as e:
-        log(f"OpenRouter exception: {e}")
-        return None
 
-def analyze_patch(title, raw_text, link=""):
-    text = fetch_full_article(link) if link else raw_text
-    if not text:
-        return None
-    return analyze_with_qwen(text)
+    # Повторные попытки
+    for attempt in range(3):
+        try:
+            r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
+            if r.status_code == 429:
+                wait = 2 ** attempt
+                log(f"Превышен лимит, ждём {wait}с...")
+                time.sleep(wait)
+                continue
+            if r.status_code != 200:
+                log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
+                return None
+            response_text = r.json()["choices"][0]["message"]["content"]
+            # Извлекаем JSON из ответа
+            match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if not match:
+                log("Не найден JSON в ответе модели")
+                log(f"Ответ: {response_text[:200]}")
+                return None
+            json_str = match.group(0)
+            # Убираем возможные Markdown-обрамления
+            json_str = re.sub(r'^```(?:json)?\s*\n?', '', json_str, flags=re.MULTILINE)
+            json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
+            return json.loads(json_str)
+        except Exception as e:
+            log(f"Ошибка при запросе (попытка {attempt+1}): {e}")
+            time.sleep(1)
+    return None
 
+# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА ----------
 def format_message(game, title, link, raw_text):
+    """Формирует сообщения для Discord на основе анализа."""
     game_name = GAME_NAMES.get(game, game)
     version_match = re.search(r'(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)', title)
     version = version_match.group(1) if version_match else ""
 
-    analysis = analyze_patch(title, raw_text, link)
-    if analysis is None:
+    full_text = fetch_full_article(link) if link else raw_text
+    if not full_text:
+        log("Не удалось получить текст статьи")
         return None
+
+    analysis = analyze_with_qwen(full_text)
+    if analysis is None:
+        log("Анализ не удался")
+        return None
+
     if analysis.get("nothing_new"):
+        log(f"Нет новых изменений: {analysis.get('reason', '')}")
         return []
 
     main_emoji = analysis.get("main_emoji", "📦")
@@ -159,6 +194,8 @@ def format_message(game, title, link, raw_text):
         emoji = section.get("emoji", "🔹")
         section_title = section.get("title", "Изменения")
         items = section.get("items", [])
+        if not items:
+            continue
         block = f"\n### {emoji} {section_title}:\n"
         for item in items[:10]:
             block += f"🔹 {item}\n"
@@ -176,25 +213,38 @@ def format_message(game, title, link, raw_text):
     return messages
 
 def send_to_discord(game, title, link, raw_text):
-    if not WEBHOOKS.get(game):
+    """Отправляет сообщение в Discord, проверяя кеш."""
+    webhook = WEBHOOKS.get(game)
+    if not webhook:
+        log(f"Вебхук для {game} не настроен")
         return
+
+    if is_processed(game, title):
+        log(f"Новость уже обработана: {title}")
+        return
+
     messages = format_message(game, title, link, raw_text)
     if not messages:
-        log(f"ПРОПУСК (нет данных) {game}: {title}")
+        log(f"Нет сообщений для отправки ({title})")
         return
+
+    # Помечаем как обработанную
+    mark_processed(game, title)
+
     for msg in messages:
         payload = {"content": msg, "allowed_mentions": {"parse": []}}
         try:
-            r = requests.post(WEBHOOKS[game], json=payload)
+            r = requests.post(webhook, json=payload)
             if r.status_code == 204:
-                log(f"DISCORD OK {game}: {title}")
+                log(f"Отправлено в Discord для {game}: {title}")
             else:
-                log(f"DISCORD error {r.status_code}: {r.text[:200]}")
+                log(f"Ошибка Discord {r.status_code}: {r.text[:200]}")
         except Exception as e:
-            log(f"DISCORD error: {e}")
+            log(f"Ошибка отправки в Discord: {e}")
         time.sleep(2)
 
 def is_old(published_parsed):
+    """Проверяет, старше ли новость 30 дней."""
     if not published_parsed:
         return False
     try:
@@ -204,24 +254,28 @@ def is_old(published_parsed):
         return False
 
 def check_feeds():
-    log("CHECK: RSS")
+    """Проверяет все RSS-ленты и обрабатывает только последнюю запись каждой."""
+    log("Проверка RSS...")
     for game, url in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(url)
             if not feed.entries:
+                log(f"Нет записей в {game}")
                 continue
-            for entry in feed.entries[:10]:
-                if is_old(entry.get("published_parsed")):
-                    continue
-                title = entry.get("title", "Без названия")
-                link = entry.get("link", "")
-                raw = entry.get("summary", entry.get("description", ""))
-                log(f"Отправка {game}: {title}")
-                send_to_discord(game, title, link, raw)
-                break
+            # Берём только самую свежую запись
+            entry = feed.entries[0]
+            if is_old(entry.get("published_parsed")):
+                log(f"Новость старая: {entry.get('title')}")
+                continue
+            title = entry.get("title", "Без названия")
+            link = entry.get("link", "")
+            raw = entry.get("summary", entry.get("description", ""))
+            log(f"Обработка {game}: {title}")
+            send_to_discord(game, title, link, raw)
         except Exception as e:
-            log(f"RSS error {game}: {e}")
+            log(f"Ошибка RSS для {game}: {e}")
 
+# ---------- FLASK ----------
 @app.route("/")
 def home():
     return "Monitor running"
