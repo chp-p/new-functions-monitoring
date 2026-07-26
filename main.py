@@ -45,7 +45,7 @@ RSS_FEEDS = {
     "garrysmod": "https://store.steampowered.com/feeds/news/app/4000/",
     "unturned": "https://store.steampowered.com/feeds/news/app/304930/",
     "sbox": "https://sbox.facepunch.com/news/rss",
-    "warthunder": "https://warthunder.com/en/rss/news/"   # может быть пустым
+    "warthunder": "https://warthunder.com/en/rss/news/"
 }
 
 GAME_NAMES = {
@@ -58,31 +58,24 @@ GAME_NAMES = {
 
 CACHE_FILE = "/tmp/processed_news.txt"
 
-# ---------- ПРОВЕРКА КВОТЫ OPENROUTER ----------
-def check_quota():
-    """Проверяет остаток дневных запросов (если доступно)."""
-    try:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        # OpenRouter не даёт прямой эндпоинт для квоты, но можно проверить через /auth/key
-        resp = requests.get("https://openrouter.ai/api/v1/auth/key", headers=headers, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            # В ответе может быть поле credits_remaining
-            credits = data.get("credits_remaining", None)
-            if credits is not None and credits < 0.01:
-                log("⚠️ Квота OpenRouter исчерпана! Пополните баланс или подождите завтра.")
-                return False
-            log(f"✅ Доступно кредитов: {credits}")
-            return True
-        else:
-            log("Не удалось проверить квоту, продолжаем...")
-            return True
-    except Exception as e:
-        log(f"Ошибка проверки квоты: {e}")
-        return True
+# ---------- УЛУЧШЕННЫЙ ОГРАНИЧИТЕЛЬ ЧАСТОТЫ (не более 1 запроса в 3.5 секунды) ----------
+class RateLimiter:
+    def __init__(self, requests_per_minute=17):
+        # 17 запросов в минуту — запас, чтобы точно не превысить 20
+        self.interval = 60.0 / requests_per_minute  # ≈ 3.5 секунды
+        self.last_request_time = 0
+        self.lock = threading.Lock()
+        self.lock = None  # временно убираем threading для простоты
+
+    def wait_if_needed(self):
+        now = time.time()
+        elapsed = now - self.last_request_time
+        if elapsed < self.interval:
+            sleep_time = self.interval - elapsed
+            time.sleep(sleep_time)
+        self.last_request_time = time.time()
+
+rate_limiter = RateLimiter(requests_per_minute=17)
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def log(msg):
@@ -106,7 +99,7 @@ def mark_processed(game, title):
     except Exception as e:
         log(f"Ошибка записи в кеш: {e}")
 
-# ---------- ПАРСИНГ СТАТЕЙ (с извлечением изображений) ----------
+# ---------- ПАРСИНГ СТАТЕЙ (с извлечением изображений для War Thunder) ----------
 def fetch_full_article(url, game=None):
     try:
         log(f"Загрузка статьи: {url}")
@@ -175,21 +168,21 @@ def fetch_warthunder_news_from_html():
             log(f"Ошибка загрузки страницы новостей: {r.status_code}")
             return None
         soup = BeautifulSoup(r.text, "html.parser")
-        # Ищем блок новостей
-        news_items = soup.find_all("div", class_="news-item")  # класс может отличаться
+        # Ищем блоки новостей
+        # Пробуем разные классы
+        news_items = soup.find_all("div", class_=re.compile(r"news-item|news-block|news-card"))
         if not news_items:
-            news_items = soup.find_all("div", class_="news-block")
-        if not news_items:
-            # Попробуем найти все ссылки с классом news-link
-            news_links = soup.find_all("a", class_="news-link")
+            # Ищем все ссылки, у которых href содержит '/en/news/'
+            news_links = soup.find_all("a", href=re.compile(r"/en/news/"))
             if news_links:
-                # Возьмём первую ссылку
-                first_link = news_links[0]
-                title = first_link.get_text(strip=True)
-                link = first_link.get("href")
-                if link and link.startswith("/"):
-                    link = "https://warthunder.com" + link
-                return {"title": title, "link": link}
+                # Берём первую ссылку, которая содержит текст
+                for link in news_links:
+                    if link.get_text(strip=True):
+                        title = link.get_text(strip=True)
+                        href = link.get("href")
+                        if href and href.startswith("/"):
+                            href = "https://warthunder.com" + href
+                        return {"title": title, "link": href}
         if news_items:
             first = news_items[0]
             title_tag = first.find("h2") or first.find("h3") or first.find("a")
@@ -230,12 +223,10 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов комп�
 
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА (с проверкой квоты и fallback-моделями) ----------
+# ---------- ОТПРАВКА ЗАПРОСА (с RateLimiter и fallback) ----------
 def send_request(payload, model):
-    # Проверяем квоту перед отправкой
-    if not check_quota():
-        log("⛔ Лимит OpenRouter исчерпан, пропускаем запрос.")
-        return None
+    # Применяем ограничитель частоты перед каждым запросом
+    rate_limiter.wait_if_needed()
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -459,14 +450,13 @@ def process_game(game, url):
         entries = feed.entries
         if not entries:
             log(f"RSS для {game} пуст")
-            # Если это War Thunder, пробуем HTML-парсинг
             if game == "warthunder":
                 log("Пробуем получить новости War Thunder через HTML...")
                 news = fetch_warthunder_news_from_html()
                 if news:
                     title = news.get("title")
                     link = news.get("link")
-                    raw = ""  # нет краткого описания
+                    raw = ""
                     log(f"Обработка {game} (из HTML): {title}")
                     send_to_discord(game, title, link, raw)
                 else:
@@ -489,11 +479,11 @@ def process_game(game, url):
 
 def check_feeds():
     log("Проверка RSS...")
-    # Обрабатываем игры последовательно, чтобы не перегружать OpenRouter
+    # Обрабатываем игры последовательно, с паузой не менее 3 секунд между играми
     for game, url in RSS_FEEDS.items():
         process_game(game, url)
         # Пауза между обработкой игр, чтобы дать API отдохнуть
-        time.sleep(2)
+        time.sleep(3.5)
 
 # ---------- FLASK ----------
 @app.route("/")
