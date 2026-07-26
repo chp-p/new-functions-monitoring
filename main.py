@@ -14,7 +14,7 @@ app = Flask(__name__)
 # ====== НАСТРОЙКИ ======
 
 HF_API_KEY = os.environ.get("HF_API_KEY", "")
-HF_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3/v1/chat/completions"
+HF_URL = "https://api-inference.huggingface.co/v1/chat/completions"
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
@@ -84,7 +84,7 @@ def analyze_patch(title, raw_text):
     }
 
     payload = {
-        "model": "mistralai/Mistral-7B-Instruct-v0.3",
+        "model": "mistralai/Mistral-Nemo-Instruct-2407",
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Заголовок: {title}\n\nПатч-ноут:\n{text}"}
