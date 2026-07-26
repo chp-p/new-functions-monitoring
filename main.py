@@ -11,9 +11,9 @@ from flask import Flask
 
 app = Flask(__name__)
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "qwen/qwen3.6-27b"          # <-- тестируем эту модель
+TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")
+TOGETHER_URL = "https://api.together.xyz/v1/chat/completions"
+MODEL = "deepseek-ai/DeepSeek-V3"
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
@@ -84,14 +84,14 @@ def fetch_full_article(url):
         content = re.sub(r'<[^>]+>', ' ', content)
         content = html.unescape(content)
         content = re.sub(r'\s+', ' ', content).strip()
-        return content[:12000]   # модель способна принять много текста
+        return content[:15000]
     except Exception as e:
         log(f"Fetch error: {e}")
         return ""
 
-def analyze_with_qwen(full_text):
+def analyze_with_together(full_text):
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": f"Bearer {TOGETHER_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
@@ -100,13 +100,13 @@ def analyze_with_qwen(full_text):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Полный патч-ноут:\n{full_text}"}
         ],
-        "max_tokens": 8000,
+        "max_tokens": 6000,
         "temperature": 0.2
     }
     try:
-        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=90)
+        r = requests.post(TOGETHER_URL, headers=headers, json=payload, timeout=120)
         if r.status_code != 200:
-            log(f"Groq error: {r.status_code} {r.text[:200]}")
+            log(f"Together error: {r.status_code} {r.text[:200]}")
             return None
         response_text = r.json()["choices"][0]["message"]["content"]
         # Извлекаем JSON
@@ -119,14 +119,14 @@ def analyze_with_qwen(full_text):
         json_str = re.sub(r'\n?```\s*$', '', json_str)
         return json.loads(json_str)
     except Exception as e:
-        log(f"Groq exception: {e}")
+        log(f"Together exception: {e}")
         return None
 
 def analyze_patch(title, raw_text, link=""):
     text = fetch_full_article(link) if link else raw_text
     if not text:
         return None
-    return analyze_with_qwen(text)
+    return analyze_with_together(text)
 
 def format_message(game, title, link, raw_text):
     game_name = GAME_NAMES.get(game, game)
