@@ -1,6 +1,6 @@
-
 import os
 import sys
+import time
 import requests
 import hashlib
 import re
@@ -43,10 +43,15 @@ def log(msg):
 SYSTEM_PROMPT = """Ты — анализатор патч-ноутов для игр (Rust, Garry's Mod, Unturned, s&box).
 Выдели ВСЕ технические изменения: новые методы API, хуки, консольные команды, префабы, изменения в системе строительства, электричестве, транспорте, оружии.
 
-Для каждого изменения укажи ТОЧНОЕ название метода/хука/команды/префаба если оно есть в тексте.
+ВАЖНО: Для каждого изменения указывай ТОЧНОЕ название команды/метода/хука/префаба в скобках.
+Примеры:
+- "Добавлена возможность отправлять UI-разметку (команда: SendMarkupMessage)"
+- "Новый хук для спавна вертолёта (хук: OnHelicopterSpawn)"
+- "Добавлен префаб для нового монумента (префаб: assets/bundled/prefabs/autospawn/monument/arctic_base.prefab)"
+- "Новая консольная команда (команда: killall)"
 
 Верни ТОЛЬКО JSON:
-{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Раздел","items":["конкретный пункт с названиями"]}],"nothing_new":false}
+{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Раздел","items":["конкретный пункт с названиями в скобках"]}],"nothing_new":false}
 Если нет изменений: {"nothing_new":true,"reason":"причина"}.
 Пиши на русском. Будь технически точен."""
 
@@ -58,10 +63,9 @@ def clean_html(text):
     return text.strip()
 
 def fetch_full_article(url):
-    """Загружает полный текст статьи по ссылке"""
     try:
         log(f"FETCH: загружаю {url[:80]}...")
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; RustMonitor/1.0)"})
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code == 200:
             text = re.sub(r'<script[^>]*>.*?</script>', '', r.text, flags=re.DOTALL|re.IGNORECASE)
             text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL|re.IGNORECASE)
@@ -71,34 +75,29 @@ def fetch_full_article(url):
             text = re.sub(r'<[^>]+>', ' ', text)
             text = re.sub(r'\s+', ' ', text)
             log(f"FETCH: получено {len(text)} символов")
-            return text.strip()[:12000]
-        else:
-            log(f"FETCH: статус {r.status_code}")
+            return text.strip()[:5000]
     except Exception as e:
         log(f"FETCH error: {e}")
     return ""
 
 def analyze_patch(title, raw_text, link=""):
-    # Пробуем получить полный текст по ссылке
     full_text = ""
     if link:
         full_text = fetch_full_article(link)
     
     if full_text:
-        text = full_text[:12000]
-        log(f"AI: использую полный текст ({len(text)} символов)")
+        text = full_text[:5000]
     else:
-        text = clean_html(raw_text)[:8000]
-        log(f"AI: использую RSS-текст ({len(text)} символов)")
+        text = clean_html(raw_text)[:4000]
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Заголовок: {title}\n\nПатч-ноут:\n{text}"}
+            {"role": "user", "content": f"Заголовок: {title}\n\n{text}"}
         ],
-        "max_tokens": 2000,
+        "max_tokens": 1000,
         "temperature": 0.3
     }
     
@@ -172,6 +171,7 @@ def send_to_discord(game, title, link, raw_text):
     if not WEBHOOKS.get(game):
         return
     log(f"DISCORD: отправка в {game}...")
+    time.sleep(15)
     content = format_message(game, title, link, raw_text)
     payload = {"content": content, "allowed_mentions": {"parse": []}}
     try:
@@ -191,20 +191,27 @@ def check_feeds():
             if not feed.entries:
                 log(f"RSS {game}: пусто")
                 continue
+
             if game not in seen_entries:
                 seen_entries[game] = set()
-                log(f"RSS {game}: первый запуск, {len(feed.entries)} записей")
-            for entry in feed.entries[:3]:
+                entry = feed.entries[0]
                 h = get_entry_hash(entry)
+                seen_entries[game].add(h)
                 title = entry.get("title", "Без названия")
-                if h not in seen_entries[game]:
-                    seen_entries[game].add(h)
-                    log(f"RSS НОВОЕ {game}: {title}")
-                    link = entry.get("link", "")
-                    raw = entry.get("summary", entry.get("description", ""))
-                    send_to_discord(game, title, link, raw)
-                else:
-                    log(f"RSS ПРОПУСК {game}: {title}")
+                log(f"RSS ПЕРВЫЙ {game}: {title}")
+                link = entry.get("link", "")
+                raw = entry.get("summary", entry.get("description", ""))
+                send_to_discord(game, title, link, raw)
+            else:
+                for entry in feed.entries[:5]:
+                    h = get_entry_hash(entry)
+                    title = entry.get("title", "Без названия")
+                    if h not in seen_entries[game]:
+                        seen_entries[game].add(h)
+                        log(f"RSS НОВОЕ {game}: {title}")
+                        link = entry.get("link", "")
+                        raw = entry.get("summary", entry.get("description", ""))
+                        send_to_discord(game, title, link, raw)
         except Exception as e:
             log(f"RSS error {game}: {e}")
     log("CHECK: завершено")
