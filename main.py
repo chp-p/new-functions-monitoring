@@ -56,55 +56,40 @@ def mark_processed(game, title):
     with open(CACHE_FILE, "a", encoding="utf-8") as f:
         f.write(f"{game}|{title}\n")
 
-# ---------- УЛУЧШЕННЫЙ ПАРСИНГ СТАТЕЙ (с несколькими стратегиями) ----------
+# ---------- УЛУЧШЕННЫЙ ПАРСИНГ СТАТЕЙ (адаптирован под rust.facepunch.com) ----------
 def fetch_full_article(url):
-    """Загружает полный текст статьи, используя несколько стратегий."""
+    """Загружает полный текст статьи, адаптировано под rust.facepunch.com и другие."""
     try:
         log(f"Загрузка статьи: {url}")
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
             log(f"Ошибка загрузки {url}: {r.status_code}")
             return ""
+        
         soup = BeautifulSoup(r.text, "html.parser")
         
         # Удаляем скрипты и стили
         for tag in soup(["script", "style"]):
             tag.decompose()
         
-        # Стратегии поиска контента
-        content = None
-        
-        # 1. По классам, характерным для новостей
-        classes_to_try = [
-            "post-content", "news-content", "article-content", 
-            "content", "body", "announcement_body", "news_post",
-            "entry-content", "main-content", "post-body", "article-body"
-        ]
-        for cls in classes_to_try:
-            content = soup.find("div", class_=re.compile(cls))
-            if content:
-                break
-        
-        # 2. Если не нашли, ищем по тегу article
+        # Основной контент для rust.facepunch.com находится в <div class="blog">
+        content = soup.find("div", class_="blog")
+        if not content:
+            # Для Steam новостей
+            content = soup.find("div", class_="announcement_body")
+        if not content:
+            content = soup.find("div", class_="news-section-block")
         if not content:
             content = soup.find("article")
-        
-        # 3. Если не нашли, ищем по тегу main
         if not content:
             content = soup.find("main")
-        
-        # 4. Если не нашли, ищем любой div с текстом больше 500 символов (вероятно, основной контент)
         if not content:
+            # Ищем любой div с большим количеством текста
             divs = soup.find_all("div")
             for div in divs:
-                text_len = len(div.get_text(strip=True))
-                if text_len > 500:
+                if len(div.get_text(strip=True)) > 1000:
                     content = div
                     break
-        
-        # 5. В крайнем случае берём body
-        if not content:
-            content = soup.find("body")
         
         if content:
             text = content.get_text(separator="\n", strip=True)
@@ -113,11 +98,9 @@ def fetch_full_article(url):
         
         # Очищаем и сжимаем пробелы
         text = re.sub(r'\s+', ' ', text).strip()
-        text = re.sub(r'\n\s*\n', '\n', text)  # убираем пустые строки
-        
         log(f"Загружено символов: {len(text)}")
+        
         if len(text) < 100:
-            # Если слишком мало, возможно, это не контент, логируем фрагмент для отладки
             log(f"Предупреждение: получен короткий текст. Фрагмент: {text[:200]}")
         
         return text[:50000]  # лимит 50k символов
@@ -125,7 +108,7 @@ def fetch_full_article(url):
         log(f"Ошибка загрузки статьи: {e}")
         return ""
 
-# ---------- СИСТЕМНЫЙ ПРОМПТ (с акцентом на технические идентификаторы) ----------
+# ---------- НОВЫЙ СИСТЕМНЫЙ ПРОМПТ С ЯВНЫМИ ПРИМЕРАМИ ----------
 SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из текста и представь в виде JSON на русском языке.
 
 КРИТИЧЕСКИ ВАЖНО: в тексте есть технические термины. Ты ОБЯЗАН найти и вытащить их все!
@@ -133,17 +116,17 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 Ищи и вытаскивай:
 - ConVars (консольные переменные)
 - команды (commands)
+- переменные (variables)
 - префабы (prefabs)
 - хуки (hooks)
 - методы (methods)
 - классы (classes)
-- переменные (variables)
 
-Примеры правильного вывода:
-"Добавлены ConVars для настройки окон рейдов (консольная переменная: ConVars)"
-"Удалена консольная переменная client.SetPlayerSeed (переменная: client.SetPlayerSeed)"
-"Исправлены команды cinematic_play и cinematic_stop (команда: cinematic_play, команда: cinematic_stop)"
-"Оптимизированы скрипты с использованием PrefabAttribute (префаб: PrefabAttribute)"
+ВОТ КОНКРЕТНЫЕ ПРИМЕРЫ ИЗ ЭТОГО ПАТЧ-НОУТА (ты должен найти их в тексте):
+1. "Server Owners have been given a bunch of ConVars to tweak this" → (консольная переменная: ConVars)
+2. "Remove client.SetPlayerSeed convar" → (переменная: client.SetPlayerSeed)
+3. "Fixed some issues with cinematic_play and cinematic_stop commands" → (команда: cinematic_play, команда: cinematic_stop)
+4. "duplicate of client.playerseed command" → (команда: client.playerseed)
 
 Если в тексте есть технические термины — ты ОБЯЗАН их вытащить и указать в скобках.
 НЕ ВЫДУМЫВАЙ! Если точного названия нет в тексте — не пиши его.
