@@ -41,6 +41,7 @@ GAME_NAMES = {
     "warthunder": "War Thunder"
 }
 
+# Кеш во временной папке (сбрасывается при перезапуске)
 CACHE_FILE = "/tmp/processed_news.txt"
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
@@ -51,19 +52,22 @@ def log(msg):
 def is_processed(game, title):
     if not os.path.exists(CACHE_FILE):
         return False
-    with open(CACHE_FILE, "r", encoding="utf-8") as f:
-        content = f.read()
-    return f"{game}|{title}" in content
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
+        return f"{game}|{title}" in content
+    except:
+        return False
 
 def mark_processed(game, title):
-    with open(CACHE_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{game}|{title}\n")
+    try:
+        with open(CACHE_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{game}|{title}\n")
+    except Exception as e:
+        log(f"Ошибка записи в кеш: {e}")
 
-# ---------- УНИВЕРСАЛЬНЫЙ ПАРСИНГ СТАТЕЙ (с извлечением изображений) ----------
+# ---------- ПАРСИНГ СТАТЕЙ (с изображениями) ----------
 def fetch_full_article(url, game=None):
-    """
-    Возвращает кортеж (текст_статьи, список_URL_изображений)
-    """
     try:
         log(f"Загрузка статьи: {url}")
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -74,7 +78,6 @@ def fetch_full_article(url, game=None):
         for tag in soup(["script", "style"]):
             tag.decompose()
 
-        # Определяем стратегию парсинга контента
         content = None
         if game == "rust" or "facepunch.com" in url:
             content = soup.find("div", class_="blog")
@@ -87,7 +90,6 @@ def fetch_full_article(url, game=None):
             if not content:
                 content = soup.find("div", class_="news_post")
         else:
-            # Общий поиск
             content = soup.find("div", class_="blog")
             if not content:
                 content = soup.find("div", class_="news-section-block")
@@ -112,30 +114,25 @@ def fetch_full_article(url, game=None):
         if len(text) < 100:
             log(f"Предупреждение: короткий текст. Фрагмент: {text[:200]}")
 
-        # --- Извлечение изображений (для War Thunder) ---
+        # --- Извлечение изображений (только для War Thunder) ---
         image_urls = []
         if game == "warthunder":
-            # Ищем все теги <img> внутри контента (или во всем soup)
             img_tags = soup.find_all("img")
             for img in img_tags:
                 src = img.get("src")
                 if src:
-                    # Преобразуем относительные URL в абсолютные
                     if src.startswith("//"):
                         src = "https:" + src
                     elif src.startswith("/"):
                         src = "https://warthunder.com" + src
-                    # Фильтруем маленькие иконки, аватары и т.п.
                     width = img.get("width")
                     height = img.get("height")
-                    # Если ширина/высота явно заданы и меньше 100px, пропускаем
                     if width and height:
                         try:
                             if int(width) < 100 or int(height) < 100:
                                 continue
                         except:
                             pass
-                    # Также можно проверить размер файла через HEAD, но это долго
                     image_urls.append(src)
             log(f"Найдено изображений: {len(image_urls)}")
 
@@ -144,7 +141,7 @@ def fetch_full_article(url, game=None):
         log(f"Ошибка загрузки статьи: {e}")
         return "", []
 
-# ---------- СИСТЕМНЫЙ ПРОМПТ (для всех игр) ----------
+# ---------- СИСТЕМНЫЙ ПРОМПТ ----------
 SYSTEM_PROMPT = """Ты — анализатор патч-ноутов компьютерных игр. Извлеки ВСЕ изменения из текста и представь их в виде JSON на РУССКОМ языке.
 
 КРИТИЧЕСКИ ВАЖНО: ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ВСЕ ЗАГОЛОВКИ РАЗДЕЛОВ, ПУНКТЫ И ИДЕНТИФИКАТОРЫ ДОЛЖНЫ БЫТЬ НА РУССКОМ.
@@ -208,7 +205,6 @@ def has_identifiers(analysis):
                 return True
     return False
 
-# ---------- АНАЛИЗ ----------
 def analyze_with_qwen(full_text):
     if not OPENROUTER_API_KEY:
         log("Нет API-ключа")
@@ -245,7 +241,7 @@ def analyze_with_qwen(full_text):
             return result2 if result2 else result
     return None
 
-# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD (с изображениями) ----------
+# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD ----------
 def format_message(game, title, link, raw_text):
     game_name = GAME_NAMES.get(game, game)
     version_match = re.search(r'(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)', title)
@@ -255,10 +251,6 @@ def format_message(game, title, link, raw_text):
     if not full_text or len(full_text) < 50:
         log("Не удалось загрузить полную статью, используем краткий анонс")
         full_text = raw_text
-        # Для War Thunder попробуем извлечь изображения даже из анонса
-        if game == "warthunder" and not image_urls:
-            # Попробуем спарсить изображения из raw_text, но там обычно нет HTML
-            pass
 
     if not full_text or len(full_text) < 20:
         log("Нет текста для анализа")
@@ -310,7 +302,6 @@ def format_message(game, title, link, raw_text):
         current += footer
     messages.append(current)
 
-    # Возвращаем текстовые сообщения и список URL изображений
     return messages, image_urls
 
 def send_to_discord(game, title, link, raw_text):
@@ -330,7 +321,6 @@ def send_to_discord(game, title, link, raw_text):
 
     mark_processed(game, title)
 
-    # Отправляем текстовые сообщения
     for msg in text_messages:
         if len(msg) > 2000:
             log(f"Предупреждение: длина сообщения {len(msg)} > 2000")
@@ -345,17 +335,13 @@ def send_to_discord(game, title, link, raw_text):
             log(f"Ошибка отправки в Discord: {e}")
         time.sleep(1)
 
-    # Отправляем изображения (только для War Thunder)
     if image_urls and game == "warthunder":
         log(f"Отправка {len(image_urls)} изображений для {game}")
-        # Группируем изображения по 5 в одном сообщении (чтобы не флудить)
         chunk_size = 5
         for i in range(0, len(image_urls), chunk_size):
             chunk = image_urls[i:i+chunk_size]
-            # Создаём сообщение со ссылками
             img_text = "📷 **Изображения из новости:**\n" + "\n".join(chunk)
             if len(img_text) > 2000:
-                # Если ссылки слишком длинные, разбиваем по одной
                 for url in chunk:
                     payload = {"content": f"📷 {url}", "allowed_mentions": {"parse": []}}
                     try:
@@ -379,7 +365,7 @@ def send_to_discord(game, title, link, raw_text):
                     log(f"Ошибка отправки группы изображений: {e}")
                 time.sleep(1)
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ RSS ----------
+# ---------- RSS ----------
 def is_old(published_parsed):
     if not published_parsed:
         return False
