@@ -37,111 +37,176 @@ def log(msg):
     print(msg, flush=True)
     sys.stdout.flush()
 
-def clean_html(text):
-    text = re.sub(r'<br\s*/?>', '\n', text)
-    text = re.sub(r'</p>', '\n', text)
-    text = re.sub(r'<[^>]+>', '', text)
-    text = html.unescape(text)
-    return text.strip()
-
-def fetch_full_article(url):
+def fetch_article_text(url):
+    """Скачивает и очищает ТОЛЬКО содержимое новости."""
     try:
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code == 200:
-            text = re.sub(r'<script[^>]*>.*?</script>', '', r.text, flags=re.DOTALL|re.IGNORECASE)
-            text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL|re.IGNORECASE)
-            text = re.sub(r'<nav[^>]*>.*?</nav>', '', text, flags=re.DOTALL|re.IGNORECASE)
-            text = re.sub(r'<footer[^>]*>.*?</footer>', '', text, flags=re.DOTALL|re.IGNORECASE)
-            text = re.sub(r'<header[^>]*>.*?</header>', '', text, flags=re.DOTALL|re.IGNORECASE)
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = re.sub(r'\s+', ' ', text)
-            return text.strip()
-    except:
-        pass
-    return ""
+        if r.status_code != 200:
+            return ""
+        html_text = r.text
 
-def extract_technical_details(text):
-    """Парсит текст патч-ноута и собирает разделы с техническими идентификаторами."""
+        # Попытка вырезать основной блок контента
+        content = ""
+        # Facepunch
+        match = re.search(r'<div[^>]*class="[^"]*post-content[^"]*"[^>]*>(.*?)</div>', html_text, re.DOTALL)
+        if match:
+            content = match.group(1)
+        # Steam
+        if not content:
+            match = re.search(r'<div[^>]*class="[^"]*news_content[^"]*"[^>]*>(.*?)</div>', html_text, re.DOTALL)
+            if match:
+                content = match.group(1)
+        # Если не нашли, берём всё тело
+        if not content:
+            match = re.search(r'<body[^>]*>(.*?)</body>', html_text, re.DOTALL)
+            if match:
+                content = match.group(1)
+            else:
+                content = html_text
+
+        # Убираем скрипты, стили, теги
+        content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL|re.IGNORECASE)
+        content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL|re.IGNORECASE)
+        content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL|re.IGNORECASE)
+        content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL|re.IGNORECASE)
+        content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL|re.IGNORECASE)
+        content = re.sub(r'<[^>]+>', ' ', content)
+        content = html.unescape(content)
+        content = re.sub(r'\s+', ' ', content)
+        return content.strip()
+    except Exception as e:
+        log(f"Fetch error: {e}")
+        return ""
+
+def extract_sections(text):
+    """Разбивает текст на разделы по заголовкам и ищет технические идентификаторы."""
+    # Ищем строки, похожие на заголовки (окружены ** или начинаются с #, или заканчиваются двоеточием)
+    heading_pattern = re.compile(r'(?:(?:^|\n)\s*(?:\*{1,3}|\#{1,3})\s*(.+?)(?:\*{1,3})?(?:\s*\n|$)|(?:(?:^|\n)\s*([A-Za-zА-Яа-я0-9 ]+):(?:\s|$)))', re.MULTILINE)
+    headings = [(m.group(1) or m.group(2)).strip() for m in heading_pattern.finditer(text)]
+
+    # Если заголовков нет, создаём один раздел
+    if not headings:
+        sections = [{"title": "Общие изменения", "emoji": "📦", "text": text}]
+        return sections
+
+    # Разбиваем текст между заголовками
     sections = []
-
-    # Шаблоны для разных типов идентификаторов
-    patterns = {
-        "prefab": r'(?:prefab|prefab\s*:)\s*["\`]?([^"\'\,\s\)]+\.prefab)["\`]?',
-        "concommand": r'(?:concommand|convariable|convar\.server|convar\.client)\s+["\`]?(\w+)["\`]?\s*(\d[^\s\)]*)?',
-        "command": r'(?:added command|new command|command\s*:)\s*["\`]?(\w+)["\`]?',
-        "hook": r'(?:hook\s*:?\s*|new hook\s*:?\s*)["\`]?(\w+)["\`]?',
-        "method": r'(?:method\s*:?\s*|new method\s*:?\s*)["\`]?([\w.]+)["\`]?',
-        "class": r'(?:class\s*:?\s*|new class\s*:?\s*)["\`]?([\w.]+)["\`]?',
-        "item": r'(?:item\s*:?\s*|new item\s*:?\s*)["\`]?([\w\s]+)["\`]?(?:\s*\((\d+)\))?',
-        "variable": r'(?:variable\s*:?\s*|new var\s*:?\s*)["\`]?(\w+)["\`]?'
-    }
-
-    # Разбиваем на строки для анализа
-    lines = text.split('. ')
-    current_section = {"emoji": "📦", "title": "Изменения", "items": []}
-    for line in lines:
-        line = line.strip()
-        if not line:
+    prev_pos = 0
+    for i, heading in enumerate(headings):
+        start = text.find(heading, prev_pos)
+        if start == -1:
             continue
+        if i == 0 and start > 0:
+            # Текст до первого заголовка — вступление
+            intro = text[0:start].strip()
+            if intro:
+                sections.append({"title": "Введение", "emoji": "📄", "text": intro})
+        # Конец раздела — до следующего заголовка
+        end = text.find(headings[i+1], start+len(heading)) if i+1 < len(headings) else len(text)
+        section_text = text[start+len(heading):end].strip()
+        if section_text:
+            # Подбираем эмодзи по названию заголовка
+            emoji = "📦"
+            hl = heading.lower()
+            if any(w in hl for w in ['weapon','gun','rifle','pistol','оруж','пистолет','винтовк']):
+                emoji = "🔫"
+            elif any(w in hl for w in ['vehicle','helicopter','car','boat','транспорт','вертолёт','машин']):
+                emoji = "🚁"
+            elif any(w in hl for w in ['building','base','construction','стен','фундамент','постройк']):
+                emoji = "🏗️"
+            elif any(w in hl for w in ['monument','map','world','карт','монумент','биом']):
+                emoji = "🗺️"
+            elif any(w in hl for w in ['skin','cosmetic','скин','косметик']):
+                emoji = "🎨"
+            elif any(w in hl for w in ['api','hook','oxide','carbon','modding','plugin','моддинг']):
+                emoji = "🧩"
+            elif any(w in hl for w in ['ui','hud','menu','interface','интерфейс','меню']):
+                emoji = "🖥️"
+            elif any(w in hl for w in ['sound','audio','звук','аудио']):
+                emoji = "🔊"
+            elif any(w in hl for w in ['performance','optimization','производитель','оптимизац']):
+                emoji = "⚡"
+            elif any(w in hl for w in ['event','halloween','christmas','событие','хэллоуин']):
+                emoji = "🎉"
+            elif any(w in hl for w in ['economy','scrap','trade','vendor','экономик','торгов']):
+                emoji = "💰"
 
-        # Определяем, к какой категории относится строка
-        line_lower = line.lower()
-        if any(w in line_lower for w in ['weapon', 'gun', 'rifle', 'pistol', 'оруж', 'пистолет', 'винтовк']):
-            current_section = {"emoji": "🔫", "title": "Новое оружие", "items": []}
-        elif any(w in line_lower for w in ['vehicle', 'helicopter', 'car', 'boat', 'транспорт', 'вертолёт', 'машин']):
-            current_section = {"emoji": "🚁", "title": "Новый транспорт", "items": []}
-        elif any(w in line_lower for w in ['building', 'base', 'construction', 'стен', 'фундамент', 'постройк']):
-            current_section = {"emoji": "🏗️", "title": "Строительство и базы", "items": []}
-        elif any(w in line_lower for w in ['monument', 'map', 'world', 'карт', 'монумент', 'биом']):
-            current_section = {"emoji": "🗺️", "title": "Карта и монументы", "items": []}
-        elif any(w in line_lower for w in ['skin', 'cosmetic', 'скин', 'косметик']):
-            current_section = {"emoji": "🎨", "title": "Скины и косметика", "items": []}
-        elif any(w in line_lower for w in ['api', 'hook', 'oxide', 'carbon', 'modding', 'plugin', 'моддинг']):
-            current_section = {"emoji": "🧩", "title": "API и моддинг", "items": []}
-        elif any(w in line_lower for w in ['ui', 'hud', 'menu', 'interface', 'интерфейс', 'меню']):
-            current_section = {"emoji": "🖥️", "title": "Интерфейс", "items": []}
-        elif any(w in line_lower for w in ['sound', 'audio', 'звук', 'аудио']):
-            current_section = {"emoji": "🔊", "title": "Звук и аудио", "items": []}
-        elif any(w in line_lower for w in ['performance', 'optimization', 'производитель', 'оптимизац']):
-            current_section = {"emoji": "⚡", "title": "Оптимизация", "items": []}
-        elif any(w in line_lower for w in ['event', 'halloween', 'christmas', 'событие', 'хэллоуин']):
-            current_section = {"emoji": "🎉", "title": "События", "items": []}
-        elif any(w in line_lower for w in ['economy', 'scrap', 'trade', 'vendor', 'экономик', 'торгов']):
-            current_section = {"emoji": "💰", "title": "Экономика и торговля", "items": []}
-        else:
-            # Если не подошло, оставляем последнюю категорию
-            pass
-
-        # Собираем все технические идентификаторы в этой строке
-        tech_tags = []
-        for tag_type, pat in patterns.items():
-            matches = re.findall(pat, line, re.IGNORECASE)
-            for match in matches:
-                if isinstance(match, tuple):
-                    match = match[0]  # первая группа
-                tech_tags.append(f"{tag_type}: {match.strip()}")
-
-        if tech_tags:
-            # Формируем пункт с техническими деталями
-            description = line[:150]  # краткое описание
-            tech_str = ", ".join(tech_tags)
-            item = f"{description} ({tech_str})"
-            current_section["items"].append(item)
-
-    # Отбрасываем пустые разделы
-    sections = [sec for sec in [current_section] + [s for s in sections if s["items"]]]
+            sections.append({"title": heading, "emoji": emoji, "text": section_text})
+        prev_pos = end
     return sections
+
+def find_tech_identifiers(paragraph):
+    """Ищет технические идентификаторы в строке/абзаце."""
+    identifiers = []
+
+    # Префаб (путь к .prefab)
+    prefab = re.search(r'(?:prefab:?\s*)?([\w/\.-]+\.prefab)', paragraph, re.IGNORECASE)
+    if prefab:
+        identifiers.append(f"префаб: {prefab.group(1)}")
+
+    # Консольные команды/переменные (sv_..., convar, command)
+    convar = re.search(r'(?:convar|convariable|server\.|client\.)?\b(sv_\w+)\b', paragraph, re.IGNORECASE)
+    if convar:
+        identifiers.append(f"консольная команда: {convar.group(1)}")
+
+    # Хуки (On..., часто с большой буквы)
+    hook = re.search(r'(?:hook:?\s*)?\b(On\w+)\b', paragraph)
+    if hook:
+        identifiers.append(f"хук: {hook.group(1)}")
+
+    # Методы (Class.Method)
+    method = re.search(r'(?:method:?\s*)?([A-Z]\w+\.[A-Z]\w+)', paragraph)
+    if method:
+        identifiers.append(f"метод: {method.group(1)}")
+
+    # Предметы (часто в кавычках)
+    item = re.search(r'(?:item:?\s*)?["\u201c]([^"\u201d]+)["\u201d]', paragraph)
+    if item:
+        identifiers.append(f"предмет: {item.group(1)}")
+
+    return identifiers
+
+def parse_patch(text):
+    """Формирует структурированные разделы с пунктами."""
+    sections = extract_sections(text)
+    if not sections:
+        return []
+
+    result = []
+    for sec in sections:
+        items = []
+        # Разбиваем текст секции на предложения
+        sentences = re.split(r'(?<=[.!?])\s+', sec["text"])
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
+                continue
+            # Ищем технические детали
+            tech_tags = find_tech_identifiers(sent)
+            if tech_tags:
+                # Обрезаем слишком длинное описание
+                desc = sent[:120]
+                item = f"{desc} ({', '.join(tech_tags)})"
+                items.append(item)
+            else:
+                # Если нет идентификаторов, просто добавляем описание (если оно не слишком длинное)
+                if len(sent) > 30:
+                    items.append(sent[:150])
+
+        if items:
+            result.append({"emoji": sec["emoji"], "title": sec["title"], "items": items})
+    return result
 
 def analyze_patch(title, raw_text, link=""):
     full_text = ""
     if link:
-        full_text = fetch_full_article(link)
+        full_text = fetch_article_text(link)
     if not full_text:
         full_text = clean_html(raw_text)
     if not full_text:
         return None
 
-    sections = extract_technical_details(full_text)
+    sections = parse_patch(full_text)
     if not sections:
         return {"main_emoji": "📦", "sections": [], "nothing_new": True}
 
@@ -204,6 +269,13 @@ def send_to_discord(game, title, link, raw_text):
         except Exception as e:
             log(f"DISCORD error: {e}")
         time.sleep(2)
+
+def clean_html(text):
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    text = re.sub(r'</p>', '\n', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html.unescape(text)
+    return text.strip()
 
 def is_old(published_parsed):
     if not published_parsed:
