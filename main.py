@@ -17,7 +17,7 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Модель - автоматический выбор бесплатной модели
-MODEL = "nvidia/nemotron-3-ultra:free"
+MODEL = "tencent/hy3:free"
 # Если хотите фиксированную модель, раскомментируйте:
 # MODEL = "tencent/hy3:free"
 
