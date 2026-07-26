@@ -11,10 +11,12 @@ from flask import Flask
 
 app = Flask(__name__)
 
-# ====== НАСТРОЙКИ (все через Render Environment) ======
+# ====== НАСТРОЙКИ ======
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+MODEL = "deepseek-chat"
+
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
     "garrysmod": os.environ.get("WEBHOOK_GMOD", ""),
@@ -43,7 +45,7 @@ def log(msg):
     sys.stdout.flush()
 
 
-# ====== AI АНАЛИЗ ПАТЧА ======
+# ====== AI АНАЛИЗ ======
 
 SYSTEM_PROMPT = """Ты — анализатор патч-ноутов для игр (Rust, Garry's Mod, Unturned, s&box).
 Выдели ТОЛЬКО новые функции и изменения геймплея.
@@ -79,32 +81,32 @@ def analyze_patch(title, raw_text):
     if len(text) > 8000:
         text = text[:8000] + "..."
 
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": SYSTEM_PROMPT},
-                {"text": f"Заголовок: {title}\n\nПатч-ноут:\n{text}"}
-            ]
-        }],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 1500
-        }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
     }
 
-    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Заголовок: {title}\n\nПатч-ноут:\n{text}"}
+        ],
+        "max_tokens": 1500,
+        "temperature": 0.3
+    }
 
     try:
-        log("AI: запрос к Gemini...")
-        r = requests.post(url, json=payload, timeout=30)
+        log("AI: запрос к DeepSeek...")
+        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=30)
         log(f"AI: статус {r.status_code}")
 
         if r.status_code != 200:
-            log(f"AI: ошибка {r.status_code} - {r.text[:300]}")
+            log(f"AI: ошибка - {r.text[:300]}")
             return None
 
         data = r.json()
-        response_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        response_text = data["choices"][0]["message"]["content"]
         log(f"AI: ответ ({len(response_text)} символов)")
 
         response_text = re.sub(r'^```(?:json)?\s*\n?', '', response_text)
@@ -180,7 +182,6 @@ def send_to_discord(game, title, link, raw_text):
         return
 
     log(f"DISCORD: отправка в {game}...")
-    time.sleep(5)  # Защита от лимита
     content = format_message(game, title, link, raw_text)
     payload = {"content": content, "allowed_mentions": {"parse": []}}
 
