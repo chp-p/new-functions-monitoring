@@ -15,8 +15,6 @@ app = Flask(__name__)
 # ---------- КОНФИГУРАЦИЯ ----------
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# Рабочая бесплатная модель (по состоянию на июль 2026)
 MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 WEBHOOKS = {
@@ -58,9 +56,9 @@ def mark_processed(game, title):
     with open(CACHE_FILE, "a", encoding="utf-8") as f:
         f.write(f"{game}|{title}\n")
 
-# ---------- УЛУЧШЕННЫЙ ПАРСИНГ СТАТЕЙ (с BeautifulSoup) ----------
+# ---------- УЛУЧШЕННЫЙ ПАРСИНГ СТАТЕЙ (с несколькими стратегиями) ----------
 def fetch_full_article(url):
-    """Загружает полный текст статьи по ссылке, извлекая основной контент."""
+    """Загружает полный текст статьи, используя несколько стратегий."""
     try:
         log(f"Загрузка статьи: {url}")
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -73,50 +71,79 @@ def fetch_full_article(url):
         for tag in soup(["script", "style"]):
             tag.decompose()
         
-        # Ищем основной контент по нескольким возможным классам
+        # Стратегии поиска контента
         content = None
-        for class_name in ["post-content", "news-content", "article-content", "content", "body"]:
-            content = soup.find("div", class_=re.compile(class_name))
+        
+        # 1. По классам, характерным для новостей
+        classes_to_try = [
+            "post-content", "news-content", "article-content", 
+            "content", "body", "announcement_body", "news_post",
+            "entry-content", "main-content", "post-body", "article-body"
+        ]
+        for cls in classes_to_try:
+            content = soup.find("div", class_=re.compile(cls))
             if content:
                 break
+        
+        # 2. Если не нашли, ищем по тегу article
+        if not content:
+            content = soup.find("article")
+        
+        # 3. Если не нашли, ищем по тегу main
+        if not content:
+            content = soup.find("main")
+        
+        # 4. Если не нашли, ищем любой div с текстом больше 500 символов (вероятно, основной контент)
+        if not content:
+            divs = soup.find_all("div")
+            for div in divs:
+                text_len = len(div.get_text(strip=True))
+                if text_len > 500:
+                    content = div
+                    break
+        
+        # 5. В крайнем случае берём body
+        if not content:
+            content = soup.find("body")
         
         if content:
             text = content.get_text(separator="\n", strip=True)
         else:
-            body = soup.find("body")
-            if body:
-                text = body.get_text(separator="\n", strip=True)
-            else:
-                text = soup.get_text(separator="\n", strip=True)
+            text = soup.get_text(separator="\n", strip=True)
         
-        # Очищаем лишние пробелы
+        # Очищаем и сжимаем пробелы
         text = re.sub(r'\s+', ' ', text).strip()
+        text = re.sub(r'\n\s*\n', '\n', text)  # убираем пустые строки
+        
         log(f"Загружено символов: {len(text)}")
-        # Возвращаем до 50000 символов (можно увеличить)
-        return text[:50000]
+        if len(text) < 100:
+            # Если слишком мало, возможно, это не контент, логируем фрагмент для отладки
+            log(f"Предупреждение: получен короткий текст. Фрагмент: {text[:200]}")
+        
+        return text[:50000]  # лимит 50k символов
     except Exception as e:
         log(f"Ошибка загрузки статьи: {e}")
         return ""
 
-# ---------- НОВЫЙ СИСТЕМНЫЙ ПРОМПТ С АКЦЕНТОМ НА ТЕХНИЧЕСКИЕ ИДЕНТИФИКАТОРЫ ----------
+# ---------- СИСТЕМНЫЙ ПРОМПТ (с акцентом на технические идентификаторы) ----------
 SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из текста и представь в виде JSON на русском языке.
 
 КРИТИЧЕСКИ ВАЖНО: в тексте есть технические термины. Ты ОБЯЗАН найти и вытащить их все!
 
 Ищи и вытаскивай:
-- ConVars (консольные переменные) — например: "ConVars to tweak this"
-- команды (commands) — например: "cinematic_stop commands", "client.playerseed command"
-- префабы (prefabs) — например: "PrefabAttribute"
+- ConVars (консольные переменные)
+- команды (commands)
+- префабы (prefabs)
 - хуки (hooks)
 - методы (methods)
 - классы (classes)
 - переменные (variables)
 
-Пример того, как должны выглядеть пункты с идентификаторами (ЭТИ ПРИМЕРЫ ВЗЯТЫ ИЗ ЭТОГО ЖЕ ТЕКСТА):
+Примеры правильного вывода:
 "Добавлены ConVars для настройки окон рейдов (консольная переменная: ConVars)"
 "Удалена консольная переменная client.SetPlayerSeed (переменная: client.SetPlayerSeed)"
 "Исправлены команды cinematic_play и cinematic_stop (команда: cinematic_play, команда: cinematic_stop)"
-"Оптимизированы скрипты для оружейных стоек с использованием PrefabAttribute (префаб: PrefabAttribute)"
+"Оптимизированы скрипты с использованием PrefabAttribute (префаб: PrefabAttribute)"
 
 Если в тексте есть технические термины — ты ОБЯЗАН их вытащить и указать в скобках.
 НЕ ВЫДУМЫВАЙ! Если точного названия нет в тексте — не пиши его.
@@ -126,7 +153,7 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА."""
 
-# ---------- ФУНКЦИЯ ОТПРАВКИ ЗАПРОСА С ПОВТОРНЫМИ ПОПЫТКАМИ И ЛОГИРОВАНИЕМ ----------
+# ---------- ОТПРАВКА ЗАПРОСА В OPENROUTER ----------
 def send_request(payload):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -144,17 +171,12 @@ def send_request(payload):
                 log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
                 return None
             response_text = r.json()["choices"][0]["message"]["content"]
-            
-            # Логируем полный ответ для отладки
             log(f"ПОЛНЫЙ ОТВЕТ МОДЕЛИ:\n{response_text}")
-            
-            # Извлекаем JSON из ответа
             match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if not match:
                 log("Не найден JSON в ответе модели")
                 return None
             json_str = match.group(0)
-            # Убираем возможные Markdown-обрамления
             json_str = re.sub(r'^```(?:json)?\s*\n?', '', json_str, flags=re.MULTILINE)
             json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
             return json.loads(json_str)
@@ -171,13 +193,12 @@ def has_identifiers(analysis):
                 return True
     return False
 
-# ---------- ОСНОВНАЯ ФУНКЦИЯ АНАЛИЗА (с повторным запросом при отсутствии идентификаторов) ----------
+# ---------- АНАЛИЗ ТЕКСТА (с повторным запросом) ----------
 def analyze_with_qwen(full_text):
     if not OPENROUTER_API_KEY:
         log("Нет API-ключа")
         return None
 
-    # Первый запрос с явным перечислением того, что искать
     user_prompt = f"""Проанализируй патч-ноут. В тексте есть технические термины: ConVars, команды, префабы, хуки, методы, классы, переменные.
 ВЫТАЩИ ИХ ВСЕ и укажи в скобках после каждого пункта.
 
@@ -190,7 +211,7 @@ def analyze_with_qwen(full_text):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt}
         ],
-        "max_tokens": 8000,   # увеличено для детального ответа
+        "max_tokens": 8000,
         "temperature": 0.1
     }
 
@@ -216,13 +237,12 @@ def format_message(game, title, link, raw_text):
     version_match = re.search(r'(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)', title)
     version = version_match.group(1) if version_match else ""
 
-    # Загружаем полный текст по ссылке
     full_text = fetch_full_article(link) if link else raw_text
-    if not full_text:
-        log("Не удалось получить текст статьи, используем краткий анонс")
+    if not full_text or len(full_text) < 50:
+        log("Не удалось загрузить полную статью, используем краткий анонс из RSS")
         full_text = raw_text
 
-    if not full_text:
+    if not full_text or len(full_text) < 20:
         log("Нет текста для анализа")
         return None
 
@@ -312,7 +332,6 @@ def check_feeds():
             if not feed.entries:
                 log(f"Нет записей в {game}")
                 continue
-            # Берём только самую свежую запись
             entry = feed.entries[0]
             if is_old(entry.get("published_parsed")):
                 log(f"Новость старая: {entry.get('title')}")
