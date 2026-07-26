@@ -24,9 +24,9 @@ WEBHOOKS = {
 
 RSS_FEEDS = {
     "rust": "https://rust.facepunch.com/rss",
-    "garrysmod": "https://steamcommunity.com/app/4000/rss/",
-    "unturned": "https://steamcommunity.com/app/304930/rss/",
-    "sbox": "https://sbox.facepunch.com/blog/rss"
+    "garrysmod": "https://store.steampowered.com/feeds/news/app/4000/",
+    "unturned": "https://store.steampowered.com/feeds/news/app/304930/",
+    "sbox": "https://sbox.facepunch.com/rss"
 }
 
 GAME_NAMES = {
@@ -41,30 +41,29 @@ def log(msg):
     sys.stdout.flush()
 
 SYSTEM_PROMPT = """Ты — анализатор патч-ноутов для игр (Rust, Garry's Mod, Unturned, s&box).
-Выдели ВСЕ технические изменения: новые методы API, хуки, консольные команды, префабы, предметы, изменения в системе строительства, электричестве, транспорте, оружии.
+Твоя задача: перечислить ВСЕ изменения из патч-ноута, НИЧЕГО не пропуская.
+НЕ СОКРАЩАЙ. Пиши полные названия, полные пути, полные команды.
 
-ВАЖНО: Для каждого изменения перечисляй ВСЕ возможные технические идентификаторы через запятую в скобках.
+Для каждого изменения перечисляй ВСЕ возможные технические идентификаторы через запятую в скобках.
 Форматы:
-- (команда: название)
-- (хук: название)
-- (префаб: путь)
-- (метод: название)
-- (предмет: название)
-- (консольная команда: название)
-- (переменная: название)
-- (класс: название)
+- (команда: полное_название)
+- (хук: полное_название)
+- (префаб: полный_путь)
+- (метод: полное_название)
+- (предмет: полное_название)
+- (консольная команда: полная_команда)
+- (переменная: полное_название)
+- (класс: полное_название)
 
 Примеры:
-- "Добавлена возможность отправлять UI (команда: SendMarkupMessage, метод: BasePlayer.SendMarkupMessage)"
-- "Новый монумент (префаб: assets/..., команда: spawn monument)"
-- "Ускоренная прогрессия (консольная команда: sv_accelerated_progression, переменная: ConVar.Server.accelerated)"
-
-Если не знаешь точный тип — напиши все возможные варианты.
+- "Добавлена возможность отправлять UI-разметку (команда: SendMarkupMessage, метод: BasePlayer.SendMarkupMessage)"
+- "Новый монумент Apartment Complex (префаб: assets/bundled/prefabs/autospawn/monument/apartment_complex.prefab, команда: spawn monument apartment_complex)"
+- "Ускоренная прогрессия в Softcore (консольная команда: sv_accelerated_progression 2, переменная: ConVar.Server.accelerated_progression)"
 
 Верни ТОЛЬКО JSON:
-{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Раздел","items":["пункт (все идентификаторы)"]}],"nothing_new":false}
+{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Раздел","items":["полный пункт (все идентификаторы)"]}],"nothing_new":false}
 Если нет изменений: {"nothing_new":true,"reason":"причина"}.
-Пиши на русском. Будь технически точен. Максимум 10 пунктов на раздел."""
+Пиши на русском. НЕ ПРОПУСКАЙ ни одного изменения. НЕ СОКРАЩАЙ названия. Пиши ПОЛНЫЕ пути и имена."""
 
 def clean_html(text):
     text = re.sub(r'<br\s*/?>', '\n', text)
