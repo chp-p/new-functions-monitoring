@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "google/gemini-flash-1.5-8b"
+MODEL = "google/gemini-2.0-flash-exp:free"
 
 WEBHOOKS = {
     "rust": "https://discord.com/api/webhooks/1530915163325075467/s0hhJdWkYb4eGEhfPF7GPYEpsFGTLXD5rjiwdFq8eMsHF8ndf_NRMbwaIvqkxOkCdjy4",
@@ -95,16 +95,23 @@ def analyze_patch(title, raw_text):
     }
 
     try:
+        print(f"AI: запрос для '{title[:50]}...'")
         r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
+        print(f"AI: статус {r.status_code}")
+
         if r.status_code != 200:
-            print(f"API error: {r.status_code}")
+            print(f"AI: ошибка {r.status_code} - {r.text[:300]}")
             return None
 
         response_text = r.json()["choices"][0]["message"]["content"]
+        print(f"AI: ответ получен ({len(response_text)} символов)")
+
         response_text = re.sub(r'^```(?:json)?\s*\n?', '', response_text)
         response_text = re.sub(r'\n?```\s*$', '', response_text)
 
-        return json.loads(response_text)
+        result = json.loads(response_text)
+        print(f"AI: разбор успешен, секций: {len(result.get('sections', []))}")
+        return result
 
     except Exception as e:
         print(f"AI error: {e}")
@@ -176,11 +183,11 @@ def send_to_discord(game, title, link, raw_text):
     try:
         r = requests.post(WEBHOOKS[game], json=payload)
         if r.status_code == 204:
-            print(f"OK {game}: {title}")
+            print(f"DISCORD OK {game}: {title}")
         else:
-            print(f"Discord error {r.status_code}: {r.text}")
+            print(f"DISCORD error {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print(f"Send error: {e}")
+        print(f"DISCORD send error: {e}")
 
 
 def check_feeds():
@@ -188,21 +195,26 @@ def check_feeds():
         try:
             feed = feedparser.parse(url)
             if not feed.entries:
+                print(f"RSS {game}: пусто")
                 continue
 
             if game not in seen_entries:
                 seen_entries[game] = set()
+                print(f"RSS {game}: первый запуск, {len(feed.entries)} записей")
 
             for entry in feed.entries[:3]:
                 h = get_entry_hash(entry)
+                title = entry.get("title", "Без названия")
                 if h not in seen_entries[game]:
                     seen_entries[game].add(h)
-                    title = entry.get("title", "Без названия")
+                    print(f"RSS НОВОЕ {game}: {title}")
                     link = entry.get("link", "")
                     raw = entry.get("summary", entry.get("description", ""))
                     send_to_discord(game, title, link, raw)
+                else:
+                    print(f"RSS ПРОПУСК {game}: {title}")
         except Exception as e:
-            print(f"Feed error {game}: {e}")
+            print(f"RSS error {game}: {e}")
 
 
 @app.route("/")
