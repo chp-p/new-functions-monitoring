@@ -11,9 +11,9 @@ from flask import Flask
 
 app = Flask(__name__)
 
-TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")
-TOGETHER_URL = "https://api.together.xyz/v1/chat/completions"
-MODEL = "deepseek-ai/DeepSeek-V3"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = "qwen/qwen-3.6-preview"          # тестируем эту модель
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
@@ -61,6 +61,13 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 {"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Раздел","items":["пункт (идентификаторы)"]}],"nothing_new":false}
 Если изменений нет: {"nothing_new":true,"reason":"причина"}"""
 
+def clean_html(text):
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    text = re.sub(r'</p>', '\n', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html.unescape(text)
+    return text.strip()
+
 def fetch_full_article(url):
     try:
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -84,14 +91,14 @@ def fetch_full_article(url):
         content = re.sub(r'<[^>]+>', ' ', content)
         content = html.unescape(content)
         content = re.sub(r'\s+', ' ', content).strip()
-        return content[:15000]
+        return content[:12000]   # модель способна принять много текста
     except Exception as e:
         log(f"Fetch error: {e}")
         return ""
 
-def analyze_with_together(full_text):
+def analyze_with_qwen(full_text):
     headers = {
-        "Authorization": f"Bearer {TOGETHER_API_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
@@ -104,9 +111,9 @@ def analyze_with_together(full_text):
         "temperature": 0.2
     }
     try:
-        r = requests.post(TOGETHER_URL, headers=headers, json=payload, timeout=120)
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
         if r.status_code != 200:
-            log(f"Together error: {r.status_code} {r.text[:200]}")
+            log(f"OpenRouter error: {r.status_code} {r.text[:300]}")
             return None
         response_text = r.json()["choices"][0]["message"]["content"]
         # Извлекаем JSON
@@ -119,14 +126,14 @@ def analyze_with_together(full_text):
         json_str = re.sub(r'\n?```\s*$', '', json_str)
         return json.loads(json_str)
     except Exception as e:
-        log(f"Together exception: {e}")
+        log(f"OpenRouter exception: {e}")
         return None
 
 def analyze_patch(title, raw_text, link=""):
     text = fetch_full_article(link) if link else raw_text
     if not text:
         return None
-    return analyze_with_together(text)
+    return analyze_with_qwen(text)
 
 def format_message(game, title, link, raw_text):
     game_name = GAME_NAMES.get(game, game)
