@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "mistralai/mistral-7b-instruct:free"
+MODEL = "google/gemini-flash-1.5"
 
 WEBHOOKS = {
     "rust": "https://discord.com/api/webhooks/1530915163325075467/s0hhJdWkYb4eGEhfPF7GPYEpsFGTLXD5rjiwdFq8eMsHF8ndf_NRMbwaIvqkxOkCdjy4",
