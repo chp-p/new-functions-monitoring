@@ -21,21 +21,24 @@ WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
     "garrysmod": os.environ.get("WEBHOOK_GMOD", ""),
     "unturned": os.environ.get("WEBHOOK_UNTURNED", ""),
-    "sbox": os.environ.get("WEBHOOK_SBOX", "")
+    "sbox": os.environ.get("WEBHOOK_SBOX", ""),
+    "warthunder": os.environ.get("WEBHOOK_WARTHUNDER", "")
 }
 
 RSS_FEEDS = {
     "rust": "https://rust.facepunch.com/rss",
     "garrysmod": "https://store.steampowered.com/feeds/news/app/4000/",
     "unturned": "https://store.steampowered.com/feeds/news/app/304930/",
-    "sbox": "https://sbox.facepunch.com/news/rss"
+    "sbox": "https://sbox.facepunch.com/news/rss",
+    "warthunder": "https://warthunder.com/en/rss/news/"
 }
 
 GAME_NAMES = {
     "rust": "Rust",
     "garrysmod": "Garry's Mod",
     "unturned": "Unturned",
-    "sbox": "s&box"
+    "sbox": "s&box",
+    "warthunder": "War Thunder"
 }
 
 CACHE_FILE = "/tmp/processed_news.txt"
@@ -56,87 +59,117 @@ def mark_processed(game, title):
     with open(CACHE_FILE, "a", encoding="utf-8") as f:
         f.write(f"{game}|{title}\n")
 
-# ---------- УЛУЧШЕННЫЙ ПАРСИНГ СТАТЕЙ ----------
-def fetch_full_article(url):
+# ---------- УНИВЕРСАЛЬНЫЙ ПАРСИНГ СТАТЕЙ (с извлечением изображений) ----------
+def fetch_full_article(url, game=None):
+    """
+    Возвращает кортеж (текст_статьи, список_URL_изображений)
+    """
     try:
         log(f"Загрузка статьи: {url}")
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
             log(f"Ошибка загрузки {url}: {r.status_code}")
-            return ""
+            return "", []
         soup = BeautifulSoup(r.text, "html.parser")
         for tag in soup(["script", "style"]):
             tag.decompose()
-        content = soup.find("div", class_="blog")
-        if not content:
+
+        # Определяем стратегию парсинга контента
+        content = None
+        if game == "rust" or "facepunch.com" in url:
+            content = soup.find("div", class_="blog")
+        elif game == "warthunder" or "warthunder.com" in url:
+            content = soup.find("div", class_="news-text")
+            if not content:
+                content = soup.find("div", class_="content")
+        elif "steampowered.com" in url:
             content = soup.find("div", class_="announcement_body")
-        if not content:
-            content = soup.find("div", class_="news-section-block")
-        if not content:
-            content = soup.find("article")
-        if not content:
-            content = soup.find("main")
-        if not content:
-            divs = soup.find_all("div")
-            for div in divs:
-                if len(div.get_text(strip=True)) > 1000:
-                    content = div
-                    break
+            if not content:
+                content = soup.find("div", class_="news_post")
+        else:
+            # Общий поиск
+            content = soup.find("div", class_="blog")
+            if not content:
+                content = soup.find("div", class_="news-section-block")
+            if not content:
+                content = soup.find("article")
+            if not content:
+                content = soup.find("main")
+            if not content:
+                divs = soup.find_all("div")
+                for div in divs:
+                    if len(div.get_text(strip=True)) > 1000:
+                        content = div
+                        break
+
         if content:
             text = content.get_text(separator="\n", strip=True)
         else:
             text = soup.get_text(separator="\n", strip=True)
+
         text = re.sub(r'\s+', ' ', text).strip()
         log(f"Загружено символов: {len(text)}")
         if len(text) < 100:
             log(f"Предупреждение: короткий текст. Фрагмент: {text[:200]}")
-        return text[:50000]
+
+        # --- Извлечение изображений (для War Thunder) ---
+        image_urls = []
+        if game == "warthunder":
+            # Ищем все теги <img> внутри контента (или во всем soup)
+            img_tags = soup.find_all("img")
+            for img in img_tags:
+                src = img.get("src")
+                if src:
+                    # Преобразуем относительные URL в абсолютные
+                    if src.startswith("//"):
+                        src = "https:" + src
+                    elif src.startswith("/"):
+                        src = "https://warthunder.com" + src
+                    # Фильтруем маленькие иконки, аватары и т.п.
+                    width = img.get("width")
+                    height = img.get("height")
+                    # Если ширина/высота явно заданы и меньше 100px, пропускаем
+                    if width and height:
+                        try:
+                            if int(width) < 100 or int(height) < 100:
+                                continue
+                        except:
+                            pass
+                    # Также можно проверить размер файла через HEAD, но это долго
+                    image_urls.append(src)
+            log(f"Найдено изображений: {len(image_urls)}")
+
+        return text[:50000], image_urls
     except Exception as e:
         log(f"Ошибка загрузки статьи: {e}")
-        return ""
+        return "", []
 
-# ---------- СИСТЕМНЫЙ ПРОМПТ (СТРОГО РУССКИЙ) ----------
-SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из текста и представь их в виде JSON на РУССКОМ языке.
+# ---------- СИСТЕМНЫЙ ПРОМПТ (для всех игр) ----------
+SYSTEM_PROMPT = """Ты — анализатор патч-ноутов компьютерных игр. Извлеки ВСЕ изменения из текста и представь их в виде JSON на РУССКОМ языке.
 
 КРИТИЧЕСКИ ВАЖНО: ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ВСЕ ЗАГОЛОВКИ РАЗДЕЛОВ, ПУНКТЫ И ИДЕНТИФИКАТОРЫ ДОЛЖНЫ БЫТЬ НА РУССКОМ.
 
-В тексте есть технические термины (ConVars, команды, переменные, префабы, хуки, методы, классы). Ты ОБЯЗАН найти их все и указать в круглых скобках после каждого пункта.
+В тексте могут быть технические термины (команды, консольные переменные, префабы, хуки, методы, классы). Ты ОБЯЗАН найти их все и указать в круглых скобках после каждого пункта, если они есть.
 
 Форматы идентификаторов (на русском):
-- (консольная переменная: имя)
 - (команда: имя)
-- (переменная: имя)
+- (консольная переменная: имя)
 - (префаб: путь)
 - (хук: имя)
 - (метод: Класс.Метод)
 - (класс: имя)
 
-Примеры правильных пунктов на РУССКОМ:
-"Добавлены ConVars для настройки окон рейдов (консольная переменная: ConVars)"
-"Удалена консольная переменная client.SetPlayerSeed (переменная: client.SetPlayerSeed)"
-"Исправлены команды cinematic_play и cinematic_stop (команда: cinematic_play, команда: cinematic_stop)"
-
 НЕ ВЫДУМЫВАЙ идентификаторы! Если точного названия нет в тексте — не пиши его.
 
 Формат JSON:
-{
-  "main_emoji": "эмодзи",
-  "sections": [
-    {
-      "emoji": "эмодзи",
-      "title": "Название раздела на русском",
-      "items": ["пункт 1 на русском (идентификаторы)", "пункт 2"]
-    }
-  ],
-  "nothing_new": false
-}
+{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Название раздела на русском","items":["пункт 1 на русском (идентификаторы)","пункт 2"]}],"nothing_new":false}
 
 Если изменений нет:
 {"nothing_new": true, "reason": "причина на русском"}
 
-ОТВЕТ ДОЛЖЕН БЫТЬ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, И ВСЁ НА РУССКОМ ЯЗЫКЕ."""
+ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА (без полного логирования ответа) ----------
+# ---------- ОТПРАВКА ЗАПРОСА ----------
 def send_request(payload):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -175,13 +208,13 @@ def has_identifiers(analysis):
                 return True
     return False
 
-# ---------- АНАЛИЗ (ЗАПРОС НА РУССКОМ) ----------
+# ---------- АНАЛИЗ ----------
 def analyze_with_qwen(full_text):
     if not OPENROUTER_API_KEY:
         log("Нет API-ключа")
         return None
 
-    user_prompt = f"""Проанализируй этот патч-ноут. В тексте есть технические термины: ConVars, команды, префабы, хуки, методы, классы, переменные.
+    user_prompt = f"""Проанализируй этот патч-ноут. В тексте есть технические термины (команды, консольные переменные, префабы, хуки, методы, классы).
 ВЫТАЩИ ИХ ВСЕ и укажи в скобках после каждого пункта. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ.
 
 Патч-ноут:
@@ -212,29 +245,33 @@ def analyze_with_qwen(full_text):
             return result2 if result2 else result
     return None
 
-# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD ----------
+# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD (с изображениями) ----------
 def format_message(game, title, link, raw_text):
     game_name = GAME_NAMES.get(game, game)
     version_match = re.search(r'(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)', title)
     version = version_match.group(1) if version_match else ""
 
-    full_text = fetch_full_article(link) if link else raw_text
+    full_text, image_urls = fetch_full_article(link, game) if link else (raw_text, [])
     if not full_text or len(full_text) < 50:
         log("Не удалось загрузить полную статью, используем краткий анонс")
         full_text = raw_text
+        # Для War Thunder попробуем извлечь изображения даже из анонса
+        if game == "warthunder" and not image_urls:
+            # Попробуем спарсить изображения из raw_text, но там обычно нет HTML
+            pass
 
     if not full_text or len(full_text) < 20:
         log("Нет текста для анализа")
-        return None
+        return None, []
 
     analysis = analyze_with_qwen(full_text)
     if analysis is None:
         log("Анализ не удался")
-        return None
+        return None, []
 
     if analysis.get("nothing_new"):
         log(f"Нет новых изменений: {analysis.get('reason', '')}")
-        return []
+        return [], []
 
     main_emoji = analysis.get("main_emoji", "📦")
     title_line = f"{main_emoji} Обновление: **{title}**"
@@ -273,7 +310,8 @@ def format_message(game, title, link, raw_text):
         current += footer
     messages.append(current)
 
-    return messages
+    # Возвращаем текстовые сообщения и список URL изображений
+    return messages, image_urls
 
 def send_to_discord(game, title, link, raw_text):
     webhook = WEBHOOKS.get(game)
@@ -285,27 +323,63 @@ def send_to_discord(game, title, link, raw_text):
         log(f"Новость уже обработана: {title}")
         return
 
-    messages = format_message(game, title, link, raw_text)
-    if not messages:
+    text_messages, image_urls = format_message(game, title, link, raw_text)
+    if not text_messages:
         log(f"Нет сообщений для отправки ({title})")
         return
 
     mark_processed(game, title)
 
-    for msg in messages:
+    # Отправляем текстовые сообщения
+    for msg in text_messages:
         if len(msg) > 2000:
             log(f"Предупреждение: длина сообщения {len(msg)} > 2000")
         payload = {"content": msg, "allowed_mentions": {"parse": []}}
         try:
             r = requests.post(webhook, json=payload)
             if r.status_code == 204:
-                log(f"Отправлено в Discord для {game}: {title}")
+                log(f"Отправлено текстовое сообщение для {game}: {title}")
             else:
                 log(f"Ошибка Discord {r.status_code}: {r.text[:200]}")
         except Exception as e:
             log(f"Ошибка отправки в Discord: {e}")
-        time.sleep(2)
+        time.sleep(1)
 
+    # Отправляем изображения (только для War Thunder)
+    if image_urls and game == "warthunder":
+        log(f"Отправка {len(image_urls)} изображений для {game}")
+        # Группируем изображения по 5 в одном сообщении (чтобы не флудить)
+        chunk_size = 5
+        for i in range(0, len(image_urls), chunk_size):
+            chunk = image_urls[i:i+chunk_size]
+            # Создаём сообщение со ссылками
+            img_text = "📷 **Изображения из новости:**\n" + "\n".join(chunk)
+            if len(img_text) > 2000:
+                # Если ссылки слишком длинные, разбиваем по одной
+                for url in chunk:
+                    payload = {"content": f"📷 {url}", "allowed_mentions": {"parse": []}}
+                    try:
+                        r = requests.post(webhook, json=payload)
+                        if r.status_code == 204:
+                            log(f"Отправлено изображение: {url}")
+                        else:
+                            log(f"Ошибка отправки изображения: {r.status_code}")
+                    except Exception as e:
+                        log(f"Ошибка отправки изображения: {e}")
+                    time.sleep(1)
+            else:
+                payload = {"content": img_text, "allowed_mentions": {"parse": []}}
+                try:
+                    r = requests.post(webhook, json=payload)
+                    if r.status_code == 204:
+                        log(f"Отправлена группа изображений ({len(chunk)} шт)")
+                    else:
+                        log(f"Ошибка отправки группы изображений: {r.status_code}")
+                except Exception as e:
+                    log(f"Ошибка отправки группы изображений: {e}")
+                time.sleep(1)
+
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ RSS ----------
 def is_old(published_parsed):
     if not published_parsed:
         return False
