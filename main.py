@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import datetime
 import requests
 import hashlib
 import re
@@ -13,7 +14,7 @@ app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "llama-3.1-405b-reasoning"
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
@@ -26,7 +27,7 @@ RSS_FEEDS = {
     "rust": "https://rust.facepunch.com/rss",
     "garrysmod": "https://store.steampowered.com/feeds/news/app/4000/",
     "unturned": "https://store.steampowered.com/feeds/news/app/304930/",
-    "sbox": "https://sbox.facepunch.com/rss"
+    "sbox": "https://sbox.facepunch.com/news/rss"
 }
 
 GAME_NAMES = {
@@ -85,7 +86,7 @@ def fetch_full_article(url):
             text = re.sub(r'<[^>]+>', ' ', text)
             text = re.sub(r'\s+', ' ', text)
             log(f"FETCH: получено {len(text)} символов")
-            return text.strip()[:8000]
+            return text.strip()[:10000]
     except Exception as e:
         log(f"FETCH error: {e}")
     return ""
@@ -96,7 +97,7 @@ def analyze_patch(title, raw_text, link=""):
         full_text = fetch_full_article(link)
     
     if full_text:
-        text = full_text[:8000]
+        text = full_text[:10000]
     else:
         text = clean_html(raw_text)[:4000]
 
@@ -107,19 +108,29 @@ def analyze_patch(title, raw_text, link=""):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Заголовок: {title}\n\n{text}"}
         ],
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "temperature": 0.3
     }
     
     try:
-        log("AI: запрос к Groq...")
-        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=90)
+        log("AI: запрос к Groq (405B)...")
+        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=120)
         log(f"AI: статус {r.status_code}")
         if r.status_code != 200:
             log(f"AI: ошибка - {r.text[:300]}")
             return None
         response_text = r.json()["choices"][0]["message"]["content"]
         log(f"AI: ответ ({len(response_text)} символов)")
+        
+        response_text = response_text.strip()
+        if not response_text.startswith('{'):
+            log("AI: ответ не JSON, заворачиваю")
+            return {
+                "main_emoji": "📦",
+                "sections": [{"emoji": "📋", "title": "Изменения", "items": [response_text[:1800]]}],
+                "nothing_new": False
+            }
+        
         response_text = re.sub(r'^```(?:json)?\s*\n?', '', response_text)
         response_text = re.sub(r'\n?```\s*$', '', response_text)
         result = json.loads(response_text)
@@ -157,7 +168,7 @@ def format_message(game, title, link, raw_text):
         items = section.get("items", [])
         
         block = f"\n### {emoji} {section_title}:\n"
-        for item in items[:12]:
+        for item in items[:15]:
             block += f"🔹 {item}\n"
         
         if len(current + block) > 1900:
@@ -180,11 +191,20 @@ seen_entries = {}
 def get_entry_hash(entry):
     return hashlib.md5((entry.get("title","")+entry.get("link","")).encode()).hexdigest()
 
+def is_old(published_parsed):
+    if not published_parsed:
+        return False
+    try:
+        pub_date = datetime.datetime(*published_parsed[:6])
+        return (datetime.datetime.now() - pub_date).days > 30
+    except:
+        return False
+
 def send_to_discord(game, title, link, raw_text):
     if not WEBHOOKS.get(game):
         return
     log(f"DISCORD: отправка в {game}...")
-    time.sleep(15)
+    time.sleep(20)
     messages = format_message(game, title, link, raw_text)
     for msg in messages:
         payload = {"content": msg, "allowed_mentions": {"parse": []}}
@@ -210,14 +230,28 @@ def check_feeds():
 
             if game not in seen_entries:
                 seen_entries[game] = set()
-                entry = feed.entries[0]
-                h = get_entry_hash(entry)
-                seen_entries[game].add(h)
-                title = entry.get("title", "Без названия")
-                log(f"RSS ПЕРВЫЙ {game}: {title}")
-                link = entry.get("link", "")
-                raw = entry.get("summary", entry.get("description", ""))
-                send_to_discord(game, title, link, raw)
+                found = False
+                for entry in feed.entries[:10]:
+                    if is_old(entry.get("published_parsed")):
+                        continue
+                    h = get_entry_hash(entry)
+                    seen_entries[game].add(h)
+                    title = entry.get("title", "Без названия")
+                    log(f"RSS ПЕРВЫЙ {game}: {title}")
+                    link = entry.get("link", "")
+                    raw = entry.get("summary", entry.get("description", ""))
+                    send_to_discord(game, title, link, raw)
+                    found = True
+                    break
+                if not found:
+                    entry = feed.entries[0]
+                    h = get_entry_hash(entry)
+                    seen_entries[game].add(h)
+                    title = entry.get("title", "Без названия")
+                    log(f"RSS ПЕРВЫЙ (все старые) {game}: {title}")
+                    link = entry.get("link", "")
+                    raw = entry.get("summary", entry.get("description", ""))
+                    send_to_discord(game, title, link, raw)
             else:
                 for entry in feed.entries[:5]:
                     h = get_entry_hash(entry)
