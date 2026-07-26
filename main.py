@@ -9,13 +9,23 @@ import json
 import feedparser
 from flask import Flask
 from bs4 import BeautifulSoup
+import threading
+from collections import deque
 
 app = Flask(__name__)
 
 # ---------- КОНФИГУРАЦИЯ ----------
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+# Для каждой игры своя модель (бесплатные, рабочие на июль 2026)
+MODELS = {
+    "rust": "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "garrysmod": "nvidia/nemotron-3-super-120b-a12b:free",
+    "unturned": "inclusionai/ling-3.0-flash:free",
+    "sbox": "poolside/laguna-s-2.1:free",
+    "warthunder": "nvidia/nemotron-3-super-120b-a12b:free"
+}
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
@@ -43,6 +53,29 @@ GAME_NAMES = {
 
 CACHE_FILE = "/tmp/processed_news.txt"
 
+# ---------- РЕАЛИЗАЦИЯ ОГРАНИЧИТЕЛЯ ЧАСТОТЫ (20 RPM) ----------
+class RateLimiter:
+    def __init__(self, max_requests=20, period=60):
+        self.max_requests = max_requests
+        self.period = period
+        self.timestamps = deque()
+        self.lock = threading.Lock()
+
+    def wait_if_needed(self):
+        with self.lock:
+            now = time.time()
+            # Удаляем записи старше period
+            while self.timestamps and now - self.timestamps[0] > self.period:
+                self.timestamps.popleft()
+            if len(self.timestamps) >= self.max_requests:
+                sleep_time = self.period - (now - self.timestamps[0]) + 0.1
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                    now = time.time()
+            self.timestamps.append(now)
+
+rate_limiter = RateLimiter(max_requests=20, period=60)
+
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def log(msg):
     print(msg, flush=True)
@@ -65,7 +98,7 @@ def mark_processed(game, title):
     except Exception as e:
         log(f"Ошибка записи в кеш: {e}")
 
-# ---------- ПАРСИНГ СТАТЕЙ (исправлен для Steam) ----------
+# ---------- ПАРСИНГ СТАТЕЙ (с изображениями) ----------
 def fetch_full_article(url, game=None):
     try:
         log(f"Загрузка статьи: {url}")
@@ -78,51 +111,33 @@ def fetch_full_article(url, game=None):
             tag.decompose()
 
         content = None
-        
-        # --- ОСНОВНАЯ СТРАТЕГИЯ ---
         if "facepunch.com" in url:
             content = soup.find("div", class_="blog")
-            if not content:
-                content = soup.find("div", class_="post-content")
-                
         elif "warthunder.com" in url:
             content = soup.find("div", class_="news-text")
             if not content:
                 content = soup.find("div", class_="content")
-                
         elif "steampowered.com" in url:
-            # Steam: ищем announce_body (содержит реальный контент)
             content = soup.find("div", class_="announcement_body")
             if not content:
-                # Альтернативный класс
                 content = soup.find("div", class_="news_post_content")
             if not content:
-                # Ищем любой div с большим текстом (>2000 символов)
                 divs = soup.find_all("div")
                 for div in divs:
-                    text_len = len(div.get_text(strip=True))
-                    if text_len > 2000:
+                    if len(div.get_text(strip=True)) > 2000:
                         content = div
                         break
         else:
-            # Универсальный поиск
-            content = soup.find("article")
-            if not content:
-                content = soup.find("main")
-            if not content:
-                content = soup.find("div", class_="content")
+            content = soup.find("article") or soup.find("main") or soup.find("div", class_="content")
 
         if content:
             text = content.get_text(separator="\n", strip=True)
-            log(f"Извлечено из контейнера: {len(text)} символов")
         else:
             text = soup.get_text(separator="\n", strip=True)
-            log("Контейнер не найден, взят весь HTML")
 
         text = re.sub(r'\s+', ' ', text).strip()
         log(f"Загружено символов: {len(text)}")
-        
-        # --- ИЗВЛЕЧЕНИЕ ИЗОБРАЖЕНИЙ (War Thunder) ---
+
         image_urls = []
         if game == "warthunder":
             img_tags = soup.find_all("img")
@@ -133,14 +148,6 @@ def fetch_full_article(url, game=None):
                         src = "https:" + src
                     elif src.startswith("/"):
                         src = "https://warthunder.com" + src
-                    width = img.get("width")
-                    height = img.get("height")
-                    if width and height:
-                        try:
-                            if int(width) < 100 or int(height) < 100:
-                                continue
-                        except:
-                            pass
                     image_urls.append(src)
             log(f"Найдено изображений: {len(image_urls)}")
 
@@ -174,31 +181,30 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов комп�
 
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА (увеличенные задержки) ----------
-def send_request(payload):
+# ---------- ОТПРАВКА ЗАПРОСА (с ограничителем) ----------
+def send_request(payload, model):
+    # Применяем ограничитель частоты перед каждым запросом
+    rate_limiter.wait_if_needed()
+    
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
-    # Увеличиваем количество попыток и задержки
-    for attempt in range(5):
+    payload["model"] = model  # используем переданную модель
+    
+    for attempt in range(3):
         try:
             r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
             if r.status_code == 429:
-                wait = 2 ** (attempt + 1)  # 2, 4, 8, 16, 32 секунды
-                log(f"Превышен лимит, ждём {wait}с...")
+                wait = 2 ** (attempt + 1)
+                log(f"Превышен лимит для модели {model}, ждём {wait}с...")
                 time.sleep(wait)
                 continue
             if r.status_code != 200:
                 log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
-                # Если модель недоступна, пробуем запасную
-                if "model" in r.text and "unavailable" in r.text:
-                    log("Пробуем запасную модель: qwen/qwen-2.5-72b-instruct:free")
-                    payload["model"] = "qwen/qwen-2.5-72b-instruct:free"
-                    continue
                 return None
             response_text = r.json()["choices"][0]["message"]["content"]
-            log(f"Получен ответ модели (символов: {len(response_text)})")
+            log(f"Получен ответ модели {model} (символов: {len(response_text)})")
             match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if not match:
                 log("Не найден JSON в ответе модели")
@@ -219,7 +225,7 @@ def has_identifiers(analysis):
                 return True
     return False
 
-def analyze_with_qwen(full_text):
+def analyze_with_qwen(full_text, model):
     if not OPENROUTER_API_KEY:
         log("Нет API-ключа")
         return None
@@ -231,7 +237,6 @@ def analyze_with_qwen(full_text):
 {full_text}"""
 
     payload = {
-        "model": MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt}
@@ -240,23 +245,23 @@ def analyze_with_qwen(full_text):
         "temperature": 0.1
     }
 
-    result = send_request(payload)
+    result = send_request(payload, model)
     if result:
         if has_identifiers(result):
-            log("Идентификаторы найдены.")
+            log(f"Идентификаторы найдены в модели {model}.")
             return result
         else:
-            log("Идентификаторы не найдены, повторный запрос с требованием")
+            log(f"Идентификаторы не найдены в модели {model}, повторный запрос с требованием")
             user_prompt2 = f"""Ты не вытащил технические термины! Найди их и укажи в скобках. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ.
 Патч-ноут:
 {full_text}"""
             payload["messages"][1]["content"] = user_prompt2
-            result2 = send_request(payload)
+            result2 = send_request(payload, model)
             return result2 if result2 else result
     return None
 
-# ---------- ФОРМАТИРОВАНИЕ ----------
-def format_message(game, title, link, raw_text):
+# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD ----------
+def format_message(game, title, link, raw_text, model):
     game_name = GAME_NAMES.get(game, game)
     version_match = re.search(r'(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)', title)
     version = version_match.group(1) if version_match else ""
@@ -270,7 +275,7 @@ def format_message(game, title, link, raw_text):
         log("Нет текста для анализа")
         return None, []
 
-    analysis = analyze_with_qwen(full_text)
+    analysis = analyze_with_qwen(full_text, model)
     if analysis is None:
         log("Анализ не удался")
         return None, []
@@ -328,7 +333,8 @@ def send_to_discord(game, title, link, raw_text):
         log(f"Новость уже обработана: {title}")
         return
 
-    text_messages, image_urls = format_message(game, title, link, raw_text)
+    model = MODELS.get(game, "nvidia/nemotron-3-ultra-550b-a55b:free")  # модель по умолчанию
+    text_messages, image_urls = format_message(game, title, link, raw_text, model)
     if not text_messages:
         log(f"Нет сообщений для отправки ({title})")
         return
@@ -347,7 +353,7 @@ def send_to_discord(game, title, link, raw_text):
                 log(f"Ошибка Discord {r.status_code}: {r.text[:200]}")
         except Exception as e:
             log(f"Ошибка отправки в Discord: {e}")
-        time.sleep(2)  # увеличил задержку между сообщениями
+        time.sleep(2)
 
     if image_urls and game == "warthunder":
         log(f"Отправка {len(image_urls)} изображений для {game}")
@@ -379,7 +385,7 @@ def send_to_discord(game, title, link, raw_text):
                     log(f"Ошибка отправки группы изображений: {e}")
                 time.sleep(1)
 
-# ---------- RSS ----------
+# ---------- RSS (запуск в отдельных потоках) ----------
 def is_old(published_parsed):
     if not published_parsed:
         return False
@@ -389,26 +395,33 @@ def is_old(published_parsed):
     except:
         return False
 
+def process_game(game, url):
+    try:
+        feed = feedparser.parse(url)
+        if not feed.entries:
+            log(f"Нет записей в {game}")
+            return
+        entry = feed.entries[0]
+        if is_old(entry.get("published_parsed")):
+            log(f"Новость старая: {entry.get('title')}")
+            return
+        title = entry.get("title", "Без названия")
+        link = entry.get("link", "")
+        raw = entry.get("summary", entry.get("description", ""))
+        log(f"Обработка {game}: {title}")
+        send_to_discord(game, title, link, raw)
+    except Exception as e:
+        log(f"Ошибка RSS для {game}: {e}")
+
 def check_feeds():
     log("Проверка RSS...")
+    threads = []
     for game, url in RSS_FEEDS.items():
-        try:
-            feed = feedparser.parse(url)
-            if not feed.entries:
-                log(f"Нет записей в {game}")
-                continue
-            # Берём только самую свежую запись
-            entry = feed.entries[0]
-            if is_old(entry.get("published_parsed")):
-                log(f"Новость старая: {entry.get('title')}")
-                continue
-            title = entry.get("title", "Без названия")
-            link = entry.get("link", "")
-            raw = entry.get("summary", entry.get("description", ""))
-            log(f"Обработка {game}: {title}")
-            send_to_discord(game, title, link, raw)
-        except Exception as e:
-            log(f"Ошибка RSS для {game}: {e}")
+        t = threading.Thread(target=process_game, args=(game, url))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
 
 # ---------- FLASK ----------
 @app.route("/")
