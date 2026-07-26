@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import requests
 import hashlib
 import re
@@ -13,9 +14,8 @@ app = Flask(__name__)
 # ====== НАСТРОЙКИ (все через Render Environment) ======
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
-# Вебхуки тоже из переменных окружения
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
     "garrysmod": os.environ.get("WEBHOOK_GMOD", ""),
@@ -108,7 +108,6 @@ def analyze_patch(title, raw_text):
         response_text = data["candidates"][0]["content"]["parts"][0]["text"]
         log(f"AI: ответ ({len(response_text)} символов)")
 
-        # Чистим markdown
         response_text = re.sub(r'^```(?:json)?\s*\n?', '', response_text)
         response_text = re.sub(r'\n?```\s*$', '', response_text)
 
@@ -182,6 +181,7 @@ def send_to_discord(game, title, link, raw_text):
         return
 
     log(f"DISCORD: отправка в {game}...")
+    time.sleep(5)  # Защита от лимита
     content = format_message(game, title, link, raw_text)
     payload = {"content": content, "allowed_mentions": {"parse": []}}
 
