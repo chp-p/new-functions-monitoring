@@ -3,7 +3,6 @@ import sys
 import time
 import datetime
 import requests
-import hashlib
 import re
 import html
 import json
@@ -14,7 +13,7 @@ app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "openai/gpt-oss-20b"
+MODEL = "qwen/qwen3.6-27b"          # <-- тестируем эту модель
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
@@ -41,119 +40,93 @@ def log(msg):
     print(msg, flush=True)
     sys.stdout.flush()
 
-# Жёсткий промпт: требуем только то, что есть в тексте
-SYSTEM_PROMPT = """Ты — анализатор патч-ноутов.
-Извлеки ВСЕ технические изменения из фрагмента. Для каждого изменения указывай ТОЛЬКО реальные идентификаторы, которые ПРИСУТСТВУЮТ в тексте.
-НЕ пиши общие слова (UsePlayerJobs, EAC, Jobs и т.п.), если они не являются точными названиями команд/хуков/префабов/методов/предметов/переменных.
-Если в тексте нет конкретной команды или хука, НЕ ВЫДУМЫВАЙ их. Лучше пропусти пункт, чем заполняй скобки мусором.
-
-Форматы (только если нашел в тексте точное имя):
+SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из полного текста.
+Для каждого пункта укажи реальные технические идентификаторы в скобках (только если они есть в тексте).
+Форматы:
 - (команда: точная_команда)
 - (хук: точный_хук)
-- (префаб: путь_к_префабу)
+- (префаб: полный_путь_к_префабу)
 - (метод: Класс.Метод)
 - (предмет: название_предмета)
 - (консольная команда: команда)
 - (переменная: имя_переменной)
 - (класс: имя_класса)
 
+Не выдумывай идентификаторы! Если в тексте нет точного имени, не пиши его.
 Пример хорошего вывода:
-"Добавлен новый монумент (префаб: assets/bundled/prefabs/autospawn/monument/apartment_complex.prefab)"
-"Новая консольная команда (консольная команда: sv_accelerated_progression 2)"
+"Добавлен новый монумент Apartment Complex (префаб: assets/bundled/prefabs/autospawn/monument/apartment_complex.prefab, команда: rentroom)"
+"Ускоренная прогрессия (консольная команда: sv_accelerated_progression 2, переменная: ConVar.Server.accelerated_progression)"
 
 Верни ТОЛЬКО JSON:
-{"sections":[{"emoji":"эмодзи","title":"Раздел","items":["пункт (реальные идентификаторы)"]}]}
-Если не можешь найти ни одного реального идентификатора, верни {"sections":[]}"""
-
-def clean_html(text):
-    text = re.sub(r'<br\s*/?>', '\n', text)
-    text = re.sub(r'</p>', '\n', text)
-    text = re.sub(r'<[^>]+>', '', text)
-    text = html.unescape(text)
-    return text.strip()
+{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Раздел","items":["пункт (идентификаторы)"]}],"nothing_new":false}
+Если изменений нет: {"nothing_new":true,"reason":"причина"}"""
 
 def fetch_full_article(url):
     try:
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code == 200:
-            text = re.sub(r'<script[^>]*>.*?</script>', '', r.text, flags=re.DOTALL|re.IGNORECASE)
-            text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL|re.IGNORECASE)
-            text = re.sub(r'<nav[^>]*>.*?</nav>', '', text, flags=re.DOTALL|re.IGNORECASE)
-            text = re.sub(r'<footer[^>]*>.*?</footer>', '', text, flags=re.DOTALL|re.IGNORECASE)
-            text = re.sub(r'<header[^>]*>.*?</header>', '', text, flags=re.DOTALL|re.IGNORECASE)
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = re.sub(r'\s+', ' ', text)
-            return text.strip()
-    except:
-        pass
-    return ""
+        if r.status_code != 200:
+            return ""
+        text = r.text
+        content = ""
+        for tag in ['post-content', 'news_content', 'announcement_content']:
+            match = re.search(rf'<div[^>]*class="[^"]*{tag}[^"]*"[^>]*>(.*?)</div>', text, re.DOTALL)
+            if match:
+                content = match.group(1)
+                break
+        if not content:
+            match = re.search(r'<body[^>]*>(.*?)</body>', text, re.DOTALL)
+            content = match.group(1) if match else text
+        content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL|re.IGNORECASE)
+        content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL|re.IGNORECASE)
+        content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL|re.IGNORECASE)
+        content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL|re.IGNORECASE)
+        content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL|re.IGNORECASE)
+        content = re.sub(r'<[^>]+>', ' ', content)
+        content = html.unescape(content)
+        content = re.sub(r'\s+', ' ', content).strip()
+        return content[:12000]   # модель способна принять много текста
+    except Exception as e:
+        log(f"Fetch error: {e}")
+        return ""
 
-def call_groq(text_chunk):
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+def analyze_with_qwen(full_text):
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
     payload = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Фрагмент патч-ноута:\n{text_chunk}"}
+            {"role": "user", "content": f"Полный патч-ноут:\n{full_text}"}
         ],
-        "max_tokens": 3000,
-        "temperature": 0.2  # ещё меньше творчества
+        "max_tokens": 8000,
+        "temperature": 0.2
     }
     try:
-        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
+        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=90)
         if r.status_code != 200:
             log(f"Groq error: {r.status_code} {r.text[:200]}")
             return None
-        content = r.json()["choices"][0]["message"]["content"].strip()
-        match = re.search(r'\{.*\}', content, re.DOTALL)
+        response_text = r.json()["choices"][0]["message"]["content"]
+        # Извлекаем JSON
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if not match:
-            return []
+            log("No JSON in response")
+            return None
         json_str = match.group(0)
         json_str = re.sub(r'^```(?:json)?\s*\n?', '', json_str)
         json_str = re.sub(r'\n?```\s*$', '', json_str)
-        data = json.loads(json_str)
-        return data.get("sections", [])
+        return json.loads(json_str)
     except Exception as e:
         log(f"Groq exception: {e}")
         return None
 
-def analyze_patch_full(text):
-    chunk_size = 2000
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    chunks = chunks[:5]  # до 10000 символов
-    log(f"Чанков для анализа: {len(chunks)}")
-
-    all_sections = []
-    for i, chunk in enumerate(chunks):
-        log(f"Анализ чанка {i+1}/{len(chunks)}...")
-        sections = call_groq(chunk)
-        if sections is not None:
-            all_sections.extend(sections)
-        time.sleep(20)  # увеличенная пауза
-
-    merged = {}
-    for sec in all_sections:
-        title = sec.get("title", "Прочее")
-        if title not in merged:
-            merged[title] = {"emoji": sec.get("emoji", "🔹"), "title": title, "items": []}
-        merged[title]["items"].extend(sec.get("items", []))
-    return list(merged.values())
-
 def analyze_patch(title, raw_text, link=""):
-    full_text = ""
-    if link:
-        full_text = fetch_full_article(link)
-    if not full_text:
-        full_text = clean_html(raw_text)
-    if not full_text:
+    text = fetch_full_article(link) if link else raw_text
+    if not text:
         return None
-
-    sections = analyze_patch_full(full_text)
-    if not sections:
-        return {"main_emoji": "📦", "sections": [], "nothing_new": False}
-
-    main_emoji = sections[0].get("emoji", "📦") if sections else "📦"
-    return {"main_emoji": main_emoji, "sections": sections, "nothing_new": False}
+    return analyze_with_qwen(text)
 
 def format_message(game, title, link, raw_text):
     game_name = GAME_NAMES.get(game, game)
@@ -163,7 +136,7 @@ def format_message(game, title, link, raw_text):
     analysis = analyze_patch(title, raw_text, link)
     if analysis is None:
         return None
-    if analysis.get("nothing_new") or len(analysis.get("sections", [])) == 0:
+    if analysis.get("nothing_new"):
         return []
 
     main_emoji = analysis.get("main_emoji", "📦")
