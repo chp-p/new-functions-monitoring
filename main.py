@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama-3.1-70b-versatile"
+MODEL = "openai/gpt-oss-120b"
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
@@ -86,7 +86,7 @@ def fetch_full_article(url):
             text = re.sub(r'<[^>]+>', ' ', text)
             text = re.sub(r'\s+', ' ', text)
             log(f"FETCH: получено {len(text)} символов")
-            return text.strip()[:10000]
+            return text.strip()[:12000]
     except Exception as e:
         log(f"FETCH error: {e}")
     return ""
@@ -97,7 +97,7 @@ def analyze_patch(title, raw_text, link=""):
         full_text = fetch_full_article(link)
     
     if full_text:
-        text = full_text[:10000]
+        text = full_text[:12000]
     else:
         text = clean_html(raw_text)[:4000]
 
@@ -108,12 +108,12 @@ def analyze_patch(title, raw_text, link=""):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Заголовок: {title}\n\n{text}"}
         ],
-        "max_tokens": 8192,
+        "max_tokens": 16384,
         "temperature": 0.3
     }
     
     try:
-        log("AI: запрос к Groq (405B)...")
+        log("AI: запрос к Groq (GPT-OSS 120B)...")
         r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=120)
         log(f"AI: статус {r.status_code}")
         if r.status_code != 200:
