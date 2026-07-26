@@ -56,26 +56,19 @@ def mark_processed(game, title):
     with open(CACHE_FILE, "a", encoding="utf-8") as f:
         f.write(f"{game}|{title}\n")
 
-# ---------- УЛУЧШЕННЫЙ ПАРСИНГ СТАТЕЙ (адаптирован под rust.facepunch.com) ----------
+# ---------- ПАРСИНГ СТАТЕЙ ----------
 def fetch_full_article(url):
-    """Загружает полный текст статьи, адаптировано под rust.facepunch.com и другие."""
     try:
         log(f"Загрузка статьи: {url}")
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
             log(f"Ошибка загрузки {url}: {r.status_code}")
             return ""
-        
         soup = BeautifulSoup(r.text, "html.parser")
-        
-        # Удаляем скрипты и стили
         for tag in soup(["script", "style"]):
             tag.decompose()
-        
-        # Основной контент для rust.facepunch.com находится в <div class="blog">
         content = soup.find("div", class_="blog")
         if not content:
-            # Для Steam новостей
             content = soup.find("div", class_="announcement_body")
         if not content:
             content = soup.find("div", class_="news-section-block")
@@ -84,31 +77,25 @@ def fetch_full_article(url):
         if not content:
             content = soup.find("main")
         if not content:
-            # Ищем любой div с большим количеством текста
             divs = soup.find_all("div")
             for div in divs:
                 if len(div.get_text(strip=True)) > 1000:
                     content = div
                     break
-        
         if content:
             text = content.get_text(separator="\n", strip=True)
         else:
             text = soup.get_text(separator="\n", strip=True)
-        
-        # Очищаем и сжимаем пробелы
         text = re.sub(r'\s+', ' ', text).strip()
         log(f"Загружено символов: {len(text)}")
-        
         if len(text) < 100:
-            log(f"Предупреждение: получен короткий текст. Фрагмент: {text[:200]}")
-        
-        return text[:50000]  # лимит 50k символов
+            log(f"Предупреждение: короткий текст. Фрагмент: {text[:200]}")
+        return text[:50000]
     except Exception as e:
         log(f"Ошибка загрузки статьи: {e}")
         return ""
 
-# ---------- НОВЫЙ СИСТЕМНЫЙ ПРОМПТ С ЯВНЫМИ ПРИМЕРАМИ ----------
+# ---------- СИСТЕМНЫЙ ПРОМПТ ----------
 SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из текста и представь в виде JSON на русском языке.
 
 КРИТИЧЕСКИ ВАЖНО: в тексте есть технические термины. Ты ОБЯЗАН найти и вытащить их все!
@@ -136,7 +123,7 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА."""
 
-# ---------- ОТПРАВКА ЗАПРОСА В OPENROUTER ----------
+# ---------- ОТПРАВКА ЗАПРОСА (без логирования полного ответа) ----------
 def send_request(payload):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -154,7 +141,8 @@ def send_request(payload):
                 log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
                 return None
             response_text = r.json()["choices"][0]["message"]["content"]
-            log(f"ПОЛНЫЙ ОТВЕТ МОДЕЛИ:\n{response_text}")
+            # Логируем только длину ответа, чтобы не засорять логи
+            log(f"Получен ответ модели (символов: {len(response_text)})")
             match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if not match:
                 log("Не найден JSON в ответе модели")
@@ -169,14 +157,13 @@ def send_request(payload):
     return None
 
 def has_identifiers(analysis):
-    """Проверяет, есть ли в items хотя бы одна скобка с идентификатором."""
     for section in analysis.get("sections", []):
         for item in section.get("items", []):
             if re.search(r'\([^)]+\)', item):
                 return True
     return False
 
-# ---------- АНАЛИЗ ТЕКСТА (с повторным запросом) ----------
+# ---------- АНАЛИЗ ----------
 def analyze_with_qwen(full_text):
     if not OPENROUTER_API_KEY:
         log("Нет API-ключа")
@@ -204,9 +191,8 @@ def analyze_with_qwen(full_text):
             log("Идентификаторы найдены.")
             return result
         else:
-            log("Идентификаторы не найдены, отправляем повторный запрос с требованием")
-            user_prompt2 = f"""Ты не вытащил технические термины! В тексте есть ConVars, команды, префабы, хуки, методы, классы, переменные. 
-Найди их и укажи в скобках.
+            log("Идентификаторы не найдены, повторный запрос")
+            user_prompt2 = f"""Ты не вытащил технические термины! Найди и укажи в скобках.
 Патч-ноут:
 {full_text}"""
             payload["messages"][1]["content"] = user_prompt2
@@ -214,7 +200,7 @@ def analyze_with_qwen(full_text):
             return result2 if result2 else result
     return None
 
-# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD ----------
+# ---------- ФОРМАТИРОВАНИЕ (улучшенная разбивка) ----------
 def format_message(game, title, link, raw_text):
     game_name = GAME_NAMES.get(game, game)
     version_match = re.search(r'(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)', title)
@@ -222,7 +208,7 @@ def format_message(game, title, link, raw_text):
 
     full_text = fetch_full_article(link) if link else raw_text
     if not full_text or len(full_text) < 50:
-        log("Не удалось загрузить полную статью, используем краткий анонс из RSS")
+        log("Не удалось загрузить полную статью, используем краткий анонс")
         full_text = raw_text
 
     if not full_text or len(full_text) < 20:
@@ -246,6 +232,7 @@ def format_message(game, title, link, raw_text):
     messages = []
     current = f"## {title_line}\n"
     part = 1
+    max_len = 1900  # чуть меньше лимита Discord (2000)
 
     for section in analysis.get("sections", []):
         emoji = section.get("emoji", "🔹")
@@ -254,21 +241,36 @@ def format_message(game, title, link, raw_text):
         if not items:
             continue
         block = f"\n### {emoji} {section_title}:\n"
+        # Формируем блок из пунктов
+        item_lines = []
         for item in items[:10]:
-            block += f"🔹 {item}\n"
-        if len(current + block) > 1900:
+            item_lines.append(f"🔹 {item}")
+        # Если блок не влезает в текущее сообщение, отправляем его отдельно
+        if len(current + block + "\n".join(item_lines)) > max_len:
+            # Закрываем текущее сообщение
             current += f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name} (часть {part})"
             messages.append(current)
             part += 1
+            # Начинаем новое сообщение с заголовка
             current = f"## {title_line} (часть {part})\n"
-        current += block
+        # Добавляем блок и пункты
+        current += block + "\n".join(item_lines) + "\n"
 
-    current += f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name}"
+    # Добавляем ссылку в конец последнего сообщения
+    footer = f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name}"
     if part > 1:
-        current += f" (часть {part})"
+        footer += f" (часть {part})"
+    # Проверяем, влезет ли футер в текущее сообщение
+    if len(current + footer) > max_len:
+        messages.append(current)
+        current = footer
+    else:
+        current += footer
     messages.append(current)
+
     return messages
 
+# ---------- ОТПРАВКА В DISCORD ----------
 def send_to_discord(game, title, link, raw_text):
     webhook = WEBHOOKS.get(game)
     if not webhook:
@@ -287,6 +289,8 @@ def send_to_discord(game, title, link, raw_text):
     mark_processed(game, title)
 
     for msg in messages:
+        if len(msg) > 2000:
+            log(f"Предупреждение: сообщение длиной {len(msg)} символов, может не отправиться")
         payload = {"content": msg, "allowed_mentions": {"parse": []}}
         try:
             r = requests.post(webhook, json=payload)
