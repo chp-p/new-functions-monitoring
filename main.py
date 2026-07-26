@@ -40,7 +40,7 @@ GAME_NAMES = {
     "sbox": "s&box"
 }
 
-CACHE_FILE = "/tmp/processed_news.txt"   # кеш в /tmp (подходит для Render)
+CACHE_FILE = "/tmp/processed_news.txt"
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def log(msg):
@@ -58,35 +58,44 @@ def mark_processed(game, title):
     with open(CACHE_FILE, "a", encoding="utf-8") as f:
         f.write(f"{game}|{title}\n")
 
-# ---------- ПАРСИНГ СТАТЕЙ (с BeautifulSoup) ----------
-def clean_html(text):
-    soup = BeautifulSoup(text, "html.parser")
-    for tag in soup(["script", "style"]):
-        tag.decompose()
-    text = soup.get_text(separator="\n")
-    return re.sub(r'\s+', ' ', text).strip()
-
+# ---------- УЛУЧШЕННЫЙ ПАРСИНГ СТАТЕЙ (с BeautifulSoup) ----------
 def fetch_full_article(url):
+    """Загружает полный текст статьи по ссылке, извлекая основной контент."""
     try:
+        log(f"Загрузка статьи: {url}")
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
             log(f"Ошибка загрузки {url}: {r.status_code}")
             return ""
         soup = BeautifulSoup(r.text, "html.parser")
-        content_div = soup.find('div', class_=re.compile(r'(post-content|news_content|announcement_content|body|content)'))
-        if content_div:
-            for tag in content_div(["script", "style"]):
-                tag.decompose()
-            text = content_div.get_text(separator="\n", strip=True)
+        
+        # Удаляем скрипты и стили
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        
+        # Ищем основной контент. Для Rust используется class="post-content"
+        # для других игр можно расширить список
+        content = None
+        for class_name in ["post-content", "news-content", "article-content", "content", "body"]:
+            content = soup.find("div", class_=re.compile(class_name))
+            if content:
+                break
+        
+        if content:
+            text = content.get_text(separator="\n", strip=True)
         else:
-            body = soup.find('body')
+            # Если не нашли div, берем весь body
+            body = soup.find("body")
             if body:
-                for tag in body(["script", "style"]):
-                    tag.decompose()
                 text = body.get_text(separator="\n", strip=True)
             else:
-                text = clean_html(r.text)
-        return text[:30000]   # ограничим длину
+                text = soup.get_text(separator="\n", strip=True)
+        
+        # Очищаем лишние пробелы
+        text = re.sub(r'\s+', ' ', text).strip()
+        log(f"Загружено символов: {len(text)}")
+        # Возвращаем первые 50000 символов (можно увеличить)
+        return text[:50000]
     except Exception as e:
         log(f"Ошибка загрузки статьи: {e}")
         return ""
@@ -196,13 +205,11 @@ def analyze_with_qwen(full_text):
 
     result = send_request(payload)
     if result:
-        # Проверяем, есть ли в items идентификаторы (скобки)
         if has_identifiers(result):
             log("Идентификаторы найдены.")
             return result
         else:
             log("Идентификаторы не найдены, отправляем повторный запрос с требованием")
-            # Повторный запрос с более жёстким требованием
             user_prompt2 = f"""Ты не указал технические идентификаторы! Перечитай текст и ВЫТАЩИ ВСЕ КОМАНДЫ, ХУКИ, ПРЕФАБЫ, МЕТОДЫ, ПЕРЕМЕННЫЕ, КЛАССЫ, которые там есть. 
 Они должны быть в скобках после каждого пункта.
 Патч-ноут:
@@ -218,9 +225,14 @@ def format_message(game, title, link, raw_text):
     version_match = re.search(r'(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)', title)
     version = version_match.group(1) if version_match else ""
 
+    # Загружаем полный текст по ссылке
     full_text = fetch_full_article(link) if link else raw_text
     if not full_text:
-        log("Не удалось получить текст статьи")
+        log("Не удалось получить текст статьи, используем краткий анонс")
+        full_text = raw_text
+
+    if not full_text:
+        log("Нет текста для анализа")
         return None
 
     analysis = analyze_with_qwen(full_text)
