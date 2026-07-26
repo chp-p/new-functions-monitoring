@@ -12,10 +12,6 @@ from flask import Flask
 
 app = Flask(__name__)
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama-3.1-8b-instant"
-
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
     "garrysmod": os.environ.get("WEBHOOK_GMOD", ""),
@@ -41,12 +37,6 @@ def log(msg):
     print(msg, flush=True)
     sys.stdout.flush()
 
-SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из этого фрагмента.
-Для каждого пункта укажи ВСЕ технические идентификаторы в скобках через запятую:
-(команда: ...), (хук: ...), (префаб: ...), (метод: ...), (предмет: ...), (консольная команда: ...), (переменная: ...), (класс: ...).
-Верни ТОЛЬКО JSON: {"sections":[{"emoji":"эмодзи","title":"Раздел","items":["пункт (идентификаторы)"]}]}.
-Если нет изменений: {"sections":[]}. Пиши на русском, не сокращай."""
-
 def clean_html(text):
     text = re.sub(r'<br\s*/?>', '\n', text)
     text = re.sub(r'</p>', '\n', text)
@@ -70,58 +60,77 @@ def fetch_full_article(url):
         pass
     return ""
 
-def call_groq(text_chunk):
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Фрагмент патч-ноута:\n{text_chunk}"}
-        ],
-        "max_tokens": 2000,
-        "temperature": 0.3
+def extract_technical_details(text):
+    """Парсит текст патч-ноута и собирает разделы с техническими идентификаторами."""
+    sections = []
+
+    # Шаблоны для разных типов идентификаторов
+    patterns = {
+        "prefab": r'(?:prefab|prefab\s*:)\s*["\`]?([^"\'\,\s\)]+\.prefab)["\`]?',
+        "concommand": r'(?:concommand|convariable|convar\.server|convar\.client)\s+["\`]?(\w+)["\`]?\s*(\d[^\s\)]*)?',
+        "command": r'(?:added command|new command|command\s*:)\s*["\`]?(\w+)["\`]?',
+        "hook": r'(?:hook\s*:?\s*|new hook\s*:?\s*)["\`]?(\w+)["\`]?',
+        "method": r'(?:method\s*:?\s*|new method\s*:?\s*)["\`]?([\w.]+)["\`]?',
+        "class": r'(?:class\s*:?\s*|new class\s*:?\s*)["\`]?([\w.]+)["\`]?',
+        "item": r'(?:item\s*:?\s*|new item\s*:?\s*)["\`]?([\w\s]+)["\`]?(?:\s*\((\d+)\))?',
+        "variable": r'(?:variable\s*:?\s*|new var\s*:?\s*)["\`]?(\w+)["\`]?'
     }
-    try:
-        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
-        if r.status_code != 200:
-            log(f"Groq error: {r.status_code} {r.text[:200]}")
-            return None
-        content = r.json()["choices"][0]["message"]["content"].strip()
-        if not content.startswith('{'):
-            match = re.search(r'\{.*\}', content, re.DOTALL)
-            if match:
-                content = match.group(0)
-            else:
-                return []
-        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
-        content = re.sub(r'\n?```\s*$', '', content)
-        data = json.loads(content)
-        return data.get("sections", [])
-    except Exception as e:
-        log(f"Groq exception: {e}")
-        return None
 
-def analyze_patch_full(text):
-    chunk_size = 1500
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    chunks = chunks[:4]  # анализируем максимум 4 чанка (6000 символов)
-    log(f"Чанков для анализа: {len(chunks)}")
+    # Разбиваем на строки для анализа
+    lines = text.split('. ')
+    current_section = {"emoji": "📦", "title": "Изменения", "items": []}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
 
-    all_sections = []
-    for i, chunk in enumerate(chunks):
-        log(f"Анализ чанка {i+1}/{len(chunks)}...")
-        sections = call_groq(chunk)
-        if sections:
-            all_sections.extend(sections)
-        time.sleep(30)  # Увеличенная пауза
+        # Определяем, к какой категории относится строка
+        line_lower = line.lower()
+        if any(w in line_lower for w in ['weapon', 'gun', 'rifle', 'pistol', 'оруж', 'пистолет', 'винтовк']):
+            current_section = {"emoji": "🔫", "title": "Новое оружие", "items": []}
+        elif any(w in line_lower for w in ['vehicle', 'helicopter', 'car', 'boat', 'транспорт', 'вертолёт', 'машин']):
+            current_section = {"emoji": "🚁", "title": "Новый транспорт", "items": []}
+        elif any(w in line_lower for w in ['building', 'base', 'construction', 'стен', 'фундамент', 'постройк']):
+            current_section = {"emoji": "🏗️", "title": "Строительство и базы", "items": []}
+        elif any(w in line_lower for w in ['monument', 'map', 'world', 'карт', 'монумент', 'биом']):
+            current_section = {"emoji": "🗺️", "title": "Карта и монументы", "items": []}
+        elif any(w in line_lower for w in ['skin', 'cosmetic', 'скин', 'косметик']):
+            current_section = {"emoji": "🎨", "title": "Скины и косметика", "items": []}
+        elif any(w in line_lower for w in ['api', 'hook', 'oxide', 'carbon', 'modding', 'plugin', 'моддинг']):
+            current_section = {"emoji": "🧩", "title": "API и моддинг", "items": []}
+        elif any(w in line_lower for w in ['ui', 'hud', 'menu', 'interface', 'интерфейс', 'меню']):
+            current_section = {"emoji": "🖥️", "title": "Интерфейс", "items": []}
+        elif any(w in line_lower for w in ['sound', 'audio', 'звук', 'аудио']):
+            current_section = {"emoji": "🔊", "title": "Звук и аудио", "items": []}
+        elif any(w in line_lower for w in ['performance', 'optimization', 'производитель', 'оптимизац']):
+            current_section = {"emoji": "⚡", "title": "Оптимизация", "items": []}
+        elif any(w in line_lower for w in ['event', 'halloween', 'christmas', 'событие', 'хэллоуин']):
+            current_section = {"emoji": "🎉", "title": "События", "items": []}
+        elif any(w in line_lower for w in ['economy', 'scrap', 'trade', 'vendor', 'экономик', 'торгов']):
+            current_section = {"emoji": "💰", "title": "Экономика и торговля", "items": []}
+        else:
+            # Если не подошло, оставляем последнюю категорию
+            pass
 
-    merged = {}
-    for sec in all_sections:
-        title = sec.get("title", "Прочее")
-        if title not in merged:
-            merged[title] = {"emoji": sec.get("emoji", "🔹"), "title": title, "items": []}
-        merged[title]["items"].extend(sec.get("items", []))
-    return list(merged.values())
+        # Собираем все технические идентификаторы в этой строке
+        tech_tags = []
+        for tag_type, pat in patterns.items():
+            matches = re.findall(pat, line, re.IGNORECASE)
+            for match in matches:
+                if isinstance(match, tuple):
+                    match = match[0]  # первая группа
+                tech_tags.append(f"{tag_type}: {match.strip()}")
+
+        if tech_tags:
+            # Формируем пункт с техническими деталями
+            description = line[:150]  # краткое описание
+            tech_str = ", ".join(tech_tags)
+            item = f"{description} ({tech_str})"
+            current_section["items"].append(item)
+
+    # Отбрасываем пустые разделы
+    sections = [sec for sec in [current_section] + [s for s in sections if s["items"]]]
+    return sections
 
 def analyze_patch(title, raw_text, link=""):
     full_text = ""
@@ -132,11 +141,11 @@ def analyze_patch(title, raw_text, link=""):
     if not full_text:
         return None
 
-    sections = analyze_patch_full(full_text)
+    sections = extract_technical_details(full_text)
     if not sections:
-        return {"main_emoji": "📦", "sections": [], "nothing_new": False}
+        return {"main_emoji": "📦", "sections": [], "nothing_new": True}
 
-    main_emoji = sections[0].get("emoji", "📦") if sections else "📦"
+    main_emoji = sections[0]["emoji"]
     return {"main_emoji": main_emoji, "sections": sections, "nothing_new": False}
 
 def format_message(game, title, link, raw_text):
@@ -145,9 +154,7 @@ def format_message(game, title, link, raw_text):
     version = version_match.group(1) if version_match else ""
 
     analysis = analyze_patch(title, raw_text, link)
-    if analysis is None:
-        return None
-    if analysis.get("nothing_new") or len(analysis.get("sections", [])) == 0:
+    if analysis is None or analysis.get("nothing_new"):
         return []
 
     main_emoji = analysis.get("main_emoji", "📦")
