@@ -13,9 +13,8 @@ app = Flask(__name__)
 
 # ====== НАСТРОЙКИ ======
 
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-MODEL = "deepseek-chat"
+HF_API_KEY = os.environ.get("HF_API_KEY", "")
+HF_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3/v1/chat/completions"
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
@@ -47,11 +46,10 @@ def log(msg):
 
 # ====== AI АНАЛИЗ ======
 
-SYSTEM_PROMPT = """Ты — анализатор патч-ноутов для игр (Rust, Garry's Mod, Unturned, s&box).
+SYSTEM_PROMPT = """Ты — анализатор патч-ноутов для игр.
 Выдели ТОЛЬКО новые функции и изменения геймплея.
 
 Верни ТОЛЬКО JSON:
-
 {
   "main_emoji": "эмодзи",
   "sections": [
@@ -63,7 +61,6 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов для и
   ],
   "nothing_new": false
 }
-
 Если нет новых функций — {"nothing_new": true, "reason": "причина"}.
 Пиши на русском. Создавай разделы только под то, что есть в патче."""
 
@@ -82,12 +79,12 @@ def analyze_patch(title, raw_text):
         text = text[:8000] + "..."
 
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Authorization": f"Bearer {HF_API_KEY}",
         "Content-Type": "application/json"
     }
 
     payload = {
-        "model": MODEL,
+        "model": "mistralai/Mistral-7B-Instruct-v0.3",
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Заголовок: {title}\n\nПатч-ноут:\n{text}"}
@@ -97,8 +94,8 @@ def analyze_patch(title, raw_text):
     }
 
     try:
-        log("AI: запрос к DeepSeek...")
-        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=30)
+        log("AI: запрос к HuggingFace...")
+        r = requests.post(HF_URL, headers=headers, json=payload, timeout=60)
         log(f"AI: статус {r.status_code}")
 
         if r.status_code != 200:
