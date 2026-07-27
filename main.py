@@ -20,17 +20,15 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Основная модель OpenRouter
 OR_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
-# Groq API
+# GitHub Models API (теперь перед Groq)
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_URL = "https://models.github.ai/inference/chat/completions"
+GITHUB_MODEL = "openai/gpt-4.1"  # или "meta-llama/Llama-3.3-70B-Instruct"
+
+# Groq API (теперь после GitHub)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
-
-# GitHub Models API
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_URL = "https://models.github.ai/inference/chat/completions"
-# Доступные модели: можно выбрать любую из списка:
-# https://github.com/marketplace/models
-GITHUB_MODEL = "openai/gpt-4.1"  # или "meta-llama/Llama-3.3-70B-Instruct", "deepseek/deepseek-v3"
 
 # Для каждой игры используем одну и ту же модель (оставлено для совместимости)
 MODELS = {
@@ -54,8 +52,12 @@ RSS_FEEDS = {
     "garrysmod": "https://store.steampowered.com/feeds/news/app/4000/",
     "unturned": "https://store.steampowered.com/feeds/news/app/304930/",
     "sbox": "https://sbox.facepunch.com/news/rss",
-    "warthunder": "https://warthunder.com/en/rss/news/"
+    "warthunder": "https://warthunder.com/en/rss/news/"  # основные новости
 }
+
+# Дополнительный RSS для devblog War Thunder (если есть)
+# Если нет отдельного, можно оставить пустым
+WARTHUNDER_DEVBLOG_RSS = "https://warthunder.com/en/devblog/rss/"  # может не работать
 
 GAME_NAMES = {
     "rust": "Rust",
@@ -101,8 +103,9 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(requests_per_minute=17)
 
-# ---------- ФУНКЦИИ БАЗЫ ДАННЫХ ----------
+# ---------- ФУНКЦИИ БАЗЫ ДАННЫХ (с улучшенным fallback) ----------
 def is_processed(game, title):
+    # Сначала пробуем Supabase
     if SUPABASE_ENABLED and supabase:
         try:
             resp = supabase.table("processed_news").select("*").eq("game", game).eq("title", title).execute()
@@ -111,21 +114,26 @@ def is_processed(game, title):
                 return True
         except Exception as e:
             log(f"Ошибка запроса к Supabase: {e}")
-    # fallback на файл
-    CACHE_FILE = "/tmp/processed_news.txt"
-    if not os.path.exists(CACHE_FILE):
-        return False
+    # fallback на файл (используем /tmp, но если не работает - в текущую директорию)
     try:
+        CACHE_FILE = "/tmp/processed_news.txt"
+        # Проверяем, можем ли писать в /tmp
+        if not os.access("/tmp", os.W_OK):
+            CACHE_FILE = "processed_news.txt"  # fallback в текущую папку
+        if not os.path.exists(CACHE_FILE):
+            return False
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             content = f.read()
         found = f"{game}|{title}" in content
         if found:
             log(f"Найдено в файловом кеше: {game}|{title}")
         return found
-    except:
+    except Exception as e:
+        log(f"Ошибка файлового кеша (is_processed): {e}")
         return False
 
 def mark_processed(game, title):
+    # Сначала пробуем Supabase
     if SUPABASE_ENABLED and supabase:
         try:
             supabase.table("processed_news").upsert({"game": game, "title": title}, on_conflict="game,title").execute()
@@ -133,8 +141,11 @@ def mark_processed(game, title):
             return
         except Exception as e:
             log(f"Ошибка записи в Supabase: {e}")
-    CACHE_FILE = "/tmp/processed_news.txt"
+    # fallback на файл
     try:
+        CACHE_FILE = "/tmp/processed_news.txt"
+        if not os.access("/tmp", os.W_OK):
+            CACHE_FILE = "processed_news.txt"
         with open(CACHE_FILE, "a", encoding="utf-8") as f:
             f.write(f"{game}|{title}\n")
         log(f"Записано в файловый кеш: {game}|{title}")
@@ -145,7 +156,7 @@ def log(msg):
     print(msg, flush=True)
     sys.stdout.flush()
 
-# ---------- ПАРСИНГ СТАТЕЙ ----------
+# ---------- ПАРСИНГ СТАТЕЙ (с улучшенным извлечением изображений) ----------
 def fetch_full_article(url, game=None):
     try:
         log(f"Загрузка статьи: {url}")
@@ -176,17 +187,28 @@ def fetch_full_article(url, game=None):
         text = re.sub(r'\s+', ' ', text).strip()
         log(f"Загружено символов: {len(text)}")
 
+        # Извлечение изображений (расширенное для War Thunder)
         image_urls = []
         if game == "warthunder":
+            # Ищем все теги img
             for img in soup.find_all("img"):
                 src = img.get("src")
                 if src:
+                    # Преобразуем относительные ссылки в абсолютные
                     if src.startswith("//"):
                         src = "https:" + src
                     elif src.startswith("/"):
                         src = "https://warthunder.com" + src
+                    # Проверяем расширение
                     if re.search(r'\.(jpg|jpeg|png|gif|webp|bmp|svg)(\?.*)?$', src, re.I):
                         image_urls.append(src)
+            # Также ищем фоновые изображения (data-src, background-image)
+            for elem in soup.find_all(attrs={"data-src": True}):
+                src = elem["data-src"]
+                if src and src.startswith("http"):
+                    image_urls.append(src)
+            # Удаляем дубликаты
+            image_urls = list(dict.fromkeys(image_urls))
             log(f"Найдено изображений: {len(image_urls)}")
 
         return text[:50000], image_urls
@@ -194,7 +216,7 @@ def fetch_full_article(url, game=None):
         log(f"Ошибка загрузки статьи: {e}")
         return "", []
 
-# ---------- HTML-ПАРСИНГ WAR THUNDER ----------
+# ---------- HTML-ПАРСИНГ WAR THUNDER (если RSS пуст) ----------
 def fetch_warthunder_news_from_html():
     try:
         url = "https://warthunder.com/en/news/"
@@ -203,6 +225,8 @@ def fetch_warthunder_news_from_html():
         if r.status_code != 200:
             return None
         soup = BeautifulSoup(r.text, "html.parser")
+        # Ищем новости
+        news_items = []
         for item in soup.find_all("div", class_=re.compile(r"news-item|news-block|news-card")):
             title_tag = item.find("h2") or item.find("h3") or item.find("a")
             if not title_tag:
@@ -213,14 +237,22 @@ def fetch_warthunder_news_from_html():
                 href = link_tag.get("href")
                 if href and href.startswith("/"):
                     href = "https://warthunder.com" + href
-                return {"title": title, "link": href}
+                # Проверяем, является ли новость devblog
+                is_devblog = "devblog" in title.lower() or "dev blog" in title.lower()
+                news_items.append({"title": title, "link": href, "is_devblog": is_devblog})
+        # Сортируем: сначала основные новости, потом devblog
+        news_items.sort(key=lambda x: x["is_devblog"])  # False (основные) идут первыми
+        if news_items:
+            return news_items[0]  # возвращаем первую (самую приоритетную)
+        # Если не нашли через классы, ищем ссылки
         for a in soup.find_all("a", href=re.compile(r"/en/news/")):
             if a.get_text(strip=True):
                 title = a.get_text(strip=True)
                 href = a.get("href")
                 if href and href.startswith("/"):
                     href = "https://warthunder.com" + href
-                return {"title": title, "link": href}
+                is_devblog = "devblog" in title.lower()
+                return {"title": title, "link": href, "is_devblog": is_devblog}
         log("Не удалось найти новости на HTML-странице War Thunder")
         return None
     except Exception as e:
@@ -237,9 +269,9 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 Если изменений нет: {"nothing_new": true, "reason": "причина на русском"}
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА (OpenRouter → Groq → GitHub) ----------
+# ---------- ОТПРАВКА ЗАПРОСА (OpenRouter → GitHub → Groq) ----------
 def send_request(payload, model):
-    """Пытается отправить запрос: OpenRouter → Groq → GitHub Models."""
+    """Пытается отправить запрос: OpenRouter → GitHub → Groq."""
     rate_limiter.wait_if_needed()
 
     # 1. Пробуем OpenRouter
@@ -254,68 +286,28 @@ def send_request(payload, model):
             time.sleep(5)
             r = requests.post(OPENROUTER_URL, headers=headers, json=payload_copy, timeout=120)
             if r.status_code != 200:
-                log("OpenRouter всё ещё недоступна, переключаемся на Groq")
-                return send_to_groq(payload)
+                log("OpenRouter всё ещё недоступна, переключаемся на GitHub")
+                return send_to_github(payload)
         if r.status_code != 200:
             log(f"OpenRouter ошибка: {r.status_code} {r.text[:300]}")
-            return send_to_groq(payload)
+            return send_to_github(payload)
         response_text = r.json()["choices"][0]["message"]["content"]
         log("Успешный ответ от OpenRouter")
         match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if not match:
-            return send_to_groq(payload)
+            return send_to_github(payload)
         json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
         json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
         return json.loads(json_str)
     except Exception as e:
         log(f"OpenRouter ошибка: {e}")
-        return send_to_groq(payload)
-
-def send_to_groq(payload):
-    """Отправляет запрос в Groq, при ошибке переключается на GitHub Models."""
-    if GROQ_API_KEY:
-        try:
-            log(f"Пробуем Groq модель: {GROQ_MODEL}")
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            messages = payload.get("messages", [])
-            if not any(msg.get("role") == "system" for msg in messages):
-                messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-            groq_payload = {
-                "model": GROQ_MODEL,
-                "messages": messages,
-                "max_tokens": payload.get("max_tokens", 8000),
-                "temperature": payload.get("temperature", 0.1)
-            }
-            r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
-            if r.status_code == 429:
-                log("Groq лимит, ждём 5с...")
-                time.sleep(5)
-                r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
-                if r.status_code != 200:
-                    log("Groq недоступна, переключаемся на GitHub Models")
-                    return send_to_github(payload)
-            if r.status_code != 200:
-                log(f"Groq ошибка: {r.status_code} {r.text[:300]}")
-                return send_to_github(payload)
-            response_text = r.json()["choices"][0]["message"]["content"]
-            log("Успешный ответ от Groq")
-            match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if not match:
-                return send_to_github(payload)
-            json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
-            json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
-            return json.loads(json_str)
-        except Exception as e:
-            log(f"Groq ошибка: {e}")
-            return send_to_github(payload)
-    else:
         return send_to_github(payload)
 
 def send_to_github(payload):
-    """Отправляет запрос в GitHub Models."""
+    """Отправляет запрос в GitHub Models, при ошибке переключается на Groq."""
     if not GITHUB_TOKEN:
-        log("GITHUB_TOKEN не задан")
-        return None
+        log("GITHUB_TOKEN не задан, переключаемся на Groq")
+        return send_to_groq(payload)
 
     try:
         log(f"Пробуем GitHub Models: {GITHUB_MODEL}")
@@ -343,28 +335,70 @@ def send_to_github(payload):
             time.sleep(5)
             r = requests.post(GITHUB_URL, headers=headers, json=github_payload, timeout=120)
             if r.status_code != 200:
-                log(f"GitHub Models ошибка: {r.status_code} {r.text[:300]}")
-                return None
+                log("GitHub Models недоступна, переключаемся на Groq")
+                return send_to_groq(payload)
         if r.status_code != 200:
             log(f"GitHub Models ошибка: {r.status_code} {r.text[:300]}")
-            return None
+            return send_to_groq(payload)
 
         response_text = r.json()["choices"][0]["message"]["content"]
         log("Успешный ответ от GitHub Models")
         match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if not match:
-            log("Не найден JSON в ответе GitHub Models")
-            return None
+            log("Не найден JSON, переключаемся на Groq")
+            return send_to_groq(payload)
         json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
         json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
         return json.loads(json_str)
     except Exception as e:
         log(f"GitHub Models ошибка: {e}")
+        return send_to_groq(payload)
+
+def send_to_groq(payload):
+    """Отправляет запрос в Groq."""
+    if not GROQ_API_KEY:
+        log("GROQ_API_KEY не задан")
+        return None
+
+    try:
+        log(f"Пробуем Groq модель: {GROQ_MODEL}")
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        messages = payload.get("messages", [])
+        if not any(msg.get("role") == "system" for msg in messages):
+            messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        groq_payload = {
+            "model": GROQ_MODEL,
+            "messages": messages,
+            "max_tokens": payload.get("max_tokens", 8000),
+            "temperature": payload.get("temperature", 0.1)
+        }
+        r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
+        if r.status_code == 429:
+            log("Groq лимит, ждём 5с...")
+            time.sleep(5)
+            r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
+            if r.status_code != 200:
+                log("Groq недоступна")
+                return None
+        if r.status_code != 200:
+            log(f"Groq ошибка: {r.status_code} {r.text[:300]}")
+            return None
+        response_text = r.json()["choices"][0]["message"]["content"]
+        log("Успешный ответ от Groq")
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not match:
+            log("Не найден JSON в ответе Groq")
+            return None
+        json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
+        json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
+        return json.loads(json_str)
+    except Exception as e:
+        log(f"Groq ошибка: {e}")
         return None
 
 def analyze_with_qwen(full_text, model):
-    if not OPENROUTER_API_KEY and not GROQ_API_KEY and not GITHUB_TOKEN:
-        log("Нет API-ключей (OpenRouter, Groq, GitHub)")
+    if not OPENROUTER_API_KEY and not GITHUB_TOKEN and not GROQ_API_KEY:
+        log("Нет API-ключей (OpenRouter, GitHub, Groq)")
         return None
 
     user_prompt = f"""Проанализируй патч-ноут. Вытащи ВСЕ технические термины (команды, консольные переменные, префабы, хуки, методы, классы) и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
@@ -480,8 +514,10 @@ def send_to_discord(game, title, link, raw_text):
             log(f"Ошибка отправки в Discord: {e}")
         time.sleep(2)
 
+    # Улучшенная отправка изображений (War Thunder)
     if image_urls and game == "warthunder":
         log(f"Отправка {len(image_urls)} изображений для {game}")
+        # Сначала пробуем отправить как embed
         for idx, url in enumerate(image_urls[:10]):
             embed = {
                 "title": "📷 Изображение из новости",
@@ -493,12 +529,23 @@ def send_to_discord(game, title, link, raw_text):
             try:
                 r = requests.post(webhook, json=payload)
                 if r.status_code == 204:
-                    log(f"Отправлено изображение {idx+1}: {url}")
+                    log(f"Отправлено изображение {idx+1} (embed): {url}")
                 else:
-                    log(f"Ошибка отправки изображения {idx+1}: {r.status_code}")
+                    # Если embed не работает, отправляем как ссылку
+                    log(f"Embed не сработал, отправляем как ссылку: {url}")
+                    link_payload = {"content": f"📷 <{url}>", "allowed_mentions": {"parse": []}}
+                    requests.post(webhook, json=link_payload)
             except Exception as e:
                 log(f"Ошибка отправки изображения {idx+1}: {e}")
+                # Fallback: отправляем ссылку
+                try:
+                    link_payload = {"content": f"📷 <{url}>", "allowed_mentions": {"parse": []}}
+                    requests.post(webhook, json=link_payload)
+                except:
+                    pass
             time.sleep(1)
+
+        # Если изображений больше 10, отправляем ссылки
         if len(image_urls) > 10:
             extra_urls = image_urls[10:]
             links_text = "📷 **Дополнительные изображения:**\n" + "\n".join(extra_urls[:10])
@@ -512,7 +559,7 @@ def send_to_discord(game, title, link, raw_text):
             except Exception as e:
                 log(f"Ошибка отправки дополнительных ссылок: {e}")
 
-# ---------- RSS ----------
+# ---------- RSS (с приоритетом для War Thunder) ----------
 def is_old(published_parsed):
     if not published_parsed:
         return False
@@ -553,6 +600,8 @@ def process_game(game, url):
 
 def check_feeds():
     log("Проверка RSS...")
+    # Сначала обрабатываем War Thunder (основные новости)
+    # Затем другие игры
     order = ["warthunder", "garrysmod", "unturned", "sbox", "rust"]
     for game in order:
         url = RSS_FEEDS.get(game)
