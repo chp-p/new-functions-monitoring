@@ -2,3 +2,4 @@ Flask
 requests
 feedparser
 beautifulsoup4
+supabase
