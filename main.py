@@ -20,15 +20,16 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Groq API
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-# Основные модели Groq (будут перебираться при ошибках)
+# Список моделей Groq (будут перебираться по очереди)
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",      # основная
-    "qwen/qwen3.6-27b",             # альтернатива
-    "openai/gpt-oss-120b",          # ещё одна
-    "deepseek-r1-distill-llama-70b" # запасная
+    "groq/compound",
+    "llama-3.3-70b-versatile",
+    "qwen/qwen3.6-27b",
+    "openai/gpt-oss-120b",
+    "groq/compound-mini"
 ]
 
-# OpenRouter модели (для всех игр)
+# OpenRouter модели (для каждой игры, но мы будем перебирать все)
 MODELS = {
     "rust": "nvidia/nemotron-3-ultra-550b-a55b:free",
     "garrysmod": "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -37,11 +38,15 @@ MODELS = {
     "warthunder": "nvidia/nemotron-3-ultra-550b-a55b:free"
 }
 
-# Запасные модели OpenRouter (fallback)
-OR_FALLBACK_MODELS = [
-    "qwen/qwen-2.5-72b-instruct:free",
+# Список моделей OpenRouter для перебора (все бесплатные)
+OR_MODELS = [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
     "google/gemma-4-31b-it:free",
-    "deepseek/deepseek-v4-flash:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "cohere/north-mini-code:free",
+    "openai/gpt-oss-20b:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free"
 ]
 
 WEBHOOKS = {
@@ -68,18 +73,22 @@ GAME_NAMES = {
     "warthunder": "War Thunder"
 }
 
-# ---------- SUPABASE ----------
+# ---------- SUPABASE (усиленная обработка ошибок) ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 supabase: Client = None
+SUPABASE_ENABLED = False
 
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        supabase.table("processed_news").select("*").limit(1).execute()
+        # Проверяем доступность таблицы
+        test = supabase.table("processed_news").select("*").limit(1).execute()
+        SUPABASE_ENABLED = True
         print("✅ Supabase подключен, таблица существует.")
     except Exception as e:
-        print(f"⚠️ Ошибка Supabase: {e}")
+        print(f"⚠️ Ошибка подключения к Supabase: {e}")
+        SUPABASE_ENABLED = False
         supabase = None
 else:
     print("⚠️ SUPABASE_URL или SUPABASE_KEY не заданы, используется файловый кеш.")
@@ -99,31 +108,51 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(requests_per_minute=17)
 
-# ---------- ФУНКЦИИ БАЗЫ ДАННЫХ ----------
+# ---------- ФУНКЦИИ БАЗЫ ДАННЫХ (с подробным логированием) ----------
 def is_processed(game, title):
-    if supabase:
+    """Проверяет, есть ли уже запись об этой новости."""
+    if SUPABASE_ENABLED and supabase:
         try:
             resp = supabase.table("processed_news").select("*").eq("game", game).eq("title", title).execute()
-            return len(resp.data) > 0
-        except:
-            pass
+            if len(resp.data) > 0:
+                log(f"Найдено в Supabase: {game}|{title}")
+                return True
+        except Exception as e:
+            log(f"Ошибка запроса к Supabase (is_processed): {e}")
+            # Если Supabase недоступен, используем файловый кеш
     # fallback на файл
     CACHE_FILE = "/tmp/processed_news.txt"
     if not os.path.exists(CACHE_FILE):
         return False
-    with open(CACHE_FILE, "r", encoding="utf-8") as f:
-        return f"{game}|{title}" in f.read()
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
+        found = f"{game}|{title}" in content
+        if found:
+            log(f"Найдено в файловом кеше: {game}|{title}")
+        return found
+    except:
+        return False
 
 def mark_processed(game, title):
-    if supabase:
+    """Записывает новость как обработанную."""
+    if SUPABASE_ENABLED and supabase:
         try:
-            supabase.table("processed_news").insert({"game": game, "title": title}).execute()
+            # Используем upsert, чтобы избежать дублирования
+            supabase.table("processed_news").upsert({"game": game, "title": title}, on_conflict="game,title").execute()
+            log(f"Записано в Supabase: {game}|{title}")
             return
-        except:
-            pass
+        except Exception as e:
+            log(f"Ошибка записи в Supabase (mark_processed): {e}")
+            # Продолжаем запись в файл
+    # fallback на файл
     CACHE_FILE = "/tmp/processed_news.txt"
-    with open(CACHE_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{game}|{title}\n")
+    try:
+        with open(CACHE_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{game}|{title}\n")
+        log(f"Записано в файловый кеш: {game}|{title}")
+    except Exception as e:
+        log(f"Ошибка записи в файловый кеш: {e}")
 
 def log(msg):
     print(msg, flush=True)
@@ -169,7 +198,6 @@ def fetch_full_article(url, game=None):
                         src = "https:" + src
                     elif src.startswith("/"):
                         src = "https://warthunder.com" + src
-                    # Проверяем, что это изображение (по расширению или content-type)
                     if re.search(r'\.(jpg|jpeg|png|gif|webp|bmp|svg)(\?.*)?$', src, re.I):
                         image_urls.append(src)
             log(f"Найдено изображений: {len(image_urls)}")
@@ -199,7 +227,6 @@ def fetch_warthunder_news_from_html():
                 if href and href.startswith("/"):
                     href = "https://warthunder.com" + href
                 return {"title": title, "link": href}
-        # если не нашли, ищем ссылки
         for a in soup.find_all("a", href=re.compile(r"/en/news/")):
             if a.get_text(strip=True):
                 title = a.get_text(strip=True)
@@ -223,94 +250,85 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 Если изменений нет: {"nothing_new": true, "reason": "причина на русском"}
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА (с переключением на Groq и fallback моделями) ----------
-def send_request(payload, model):
-    rate_limiter.wait_if_needed()
-    
-    # Пробуем сначала OpenRouter с указанной моделью
+# ---------- ОТПРАВКА ЗАПРОСА (каждая статья сначала перебирает все OpenRouter модели) ----------
+def send_request(payload):
+    """Пытается отправить запрос через OpenRouter, перебирая все модели из OR_MODELS."""
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-    payload["model"] = model
 
-    for attempt in range(3):
-        try:
-            r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
-            if r.status_code == 429:
-                wait = 2 ** (attempt + 1)
-                log(f"Превышен лимит OpenRouter для {model}, ждём {wait}с...")
-                time.sleep(wait)
-                continue
-            if r.status_code != 200:
-                log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
-                # Пробуем OpenRouter fallback модели
-                if attempt < len(OR_FALLBACK_MODELS):
-                    fallback = OR_FALLBACK_MODELS[attempt]
-                    log(f"Переключаемся на OpenRouter запасную: {fallback}")
-                    payload["model"] = fallback
+    # Сначала пробуем все модели OpenRouter
+    for or_model in OR_MODELS:
+        log(f"Пробуем OpenRouter модель: {or_model}")
+        payload_copy = payload.copy()
+        payload_copy["model"] = or_model
+
+        for attempt in range(2):  # по 2 попытки на модель
+            try:
+                r = requests.post(OPENROUTER_URL, headers=headers, json=payload_copy, timeout=120)
+                if r.status_code == 429:
+                    wait = 2 ** (attempt + 1)
+                    log(f"OpenRouter {or_model} лимит, ждём {wait}с...")
+                    time.sleep(wait)
                     continue
-                # Если все OpenRouter модели исчерпаны, пробуем Groq
-                if GROQ_API_KEY:
-                    log("Все OpenRouter модели исчерпаны, переключаемся на Groq")
-                    return send_to_groq(payload)
-                return None
-            response_text = r.json()["choices"][0]["message"]["content"]
-            log(f"Получен ответ от OpenRouter (символов: {len(response_text)})")
-            match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if not match:
-                log("Не найден JSON в ответе OpenRouter")
-                return None
-            json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
-            json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
-            return json.loads(json_str)
-        except Exception as e:
-            log(f"Попытка OpenRouter {attempt+1} ошибка: {e}")
-            time.sleep(2 ** attempt)
-    
-    # Если OpenRouter не удался, пробуем Groq
+                if r.status_code != 200:
+                    log(f"OpenRouter {or_model} ошибка: {r.status_code} {r.text[:300]}")
+                    break  # переходим к следующей модели
+                response_text = r.json()["choices"][0]["message"]["content"]
+                log(f"Успешный ответ от OpenRouter ({or_model})")
+                match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if not match:
+                    log("Не найден JSON в ответе OpenRouter")
+                    continue
+                json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
+                json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
+                return json.loads(json_str)
+            except Exception as e:
+                log(f"OpenRouter {or_model} попытка {attempt+1} ошибка: {e}")
+                time.sleep(2 ** attempt)
+        # Если не сработало, переходим к следующей модели
+
+    # Если все OpenRouter модели не сработали, пробуем Groq
     if GROQ_API_KEY:
-        log("OpenRouter не ответил, пробуем Groq...")
+        log("Все OpenRouter модели исчерпаны, пробуем Groq...")
         return send_to_groq(payload)
+
+    log("Все модели (OpenRouter и Groq) исчерпаны")
     return None
 
 def send_to_groq(payload):
-    """Отправляет запрос в Groq с перебором моделей."""
+    """Перебирает модели Groq, пока одна не сработает."""
     if not GROQ_API_KEY:
-        log("GROQ_API_KEY не задан, невозможно использовать Groq")
+        log("GROQ_API_KEY не задан")
         return None
 
-    # Формируем сообщения для Groq (они совместимы с OpenAI)
-    messages = payload.get("messages", [])
-    # Добавляем системный промпт (если его нет)
-    if not any(msg.get("role") == "system" for msg in messages):
-        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-    
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-    
-    # Перебираем модели Groq
-    for model in GROQ_MODELS:
-        log(f"Пробуем Groq модель: {model}")
+    messages = payload.get("messages", [])
+    if not any(msg.get("role") == "system" for msg in messages):
+        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+
+    for groq_model in GROQ_MODELS:
+        log(f"Пробуем Groq модель: {groq_model}")
         groq_payload = {
-            "model": model,
+            "model": groq_model,
             "messages": messages,
             "max_tokens": payload.get("max_tokens", 8000),
             "temperature": payload.get("temperature", 0.1)
         }
-        
-        for attempt in range(2):  # по 2 попытки на модель
+        for attempt in range(2):
             try:
                 r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
                 if r.status_code == 429:
                     wait = 2 ** (attempt + 1)
-                    log(f"Превышен лимит Groq для {model}, ждём {wait}с...")
+                    log(f"Groq {groq_model} лимит, ждём {wait}с...")
                     time.sleep(wait)
                     continue
                 if r.status_code != 200:
-                    log(f"Ошибка Groq для {model}: {r.status_code} {r.text[:300]}")
-                    break  # переходим к следующей модели
+                    log(f"Groq {groq_model} ошибка: {r.status_code} {r.text[:300]}")
+                    break
                 response_text = r.json()["choices"][0]["message"]["content"]
-                log(f"Получен ответ от Groq (модель {model}, символов: {len(response_text)})")
+                log(f"Успешный ответ от Groq ({groq_model})")
                 match = re.search(r'\{.*\}', response_text, re.DOTALL)
                 if not match:
                     log("Не найден JSON в ответе Groq")
@@ -319,15 +337,13 @@ def send_to_groq(payload):
                 json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
                 return json.loads(json_str)
             except Exception as e:
-                log(f"Ошибка с Groq моделью {model}: {e}")
+                log(f"Groq {groq_model} попытка {attempt+1} ошибка: {e}")
                 time.sleep(2 ** attempt)
-        # Если модель не сработала, переходим к следующей
-    log("Все модели Groq исчерпаны")
     return None
 
 def analyze_with_qwen(full_text, model):
     if not OPENROUTER_API_KEY and not GROQ_API_KEY:
-        log("Нет API-ключей (ни OpenRouter, ни Groq)")
+        log("Нет API-ключей")
         return None
 
     user_prompt = f"""Проанализируй патч-ноут. Вытащи ВСЕ технические термины (команды, консольные переменные, префабы, хуки, методы, классы) и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
@@ -342,10 +358,10 @@ def analyze_with_qwen(full_text, model):
         "temperature": 0.1
     }
 
-    # Сначала пробуем OpenRouter с указанной моделью
-    result = send_request(payload, model)
+    # Пробуем все модели (OpenRouter перебирает, потом Groq)
+    result = send_request(payload)
+
     if result:
-        # Проверяем наличие идентификаторов
         has_id = any(re.search(r'\([^)]+\)', item) for sec in result.get("sections", []) for item in sec.get("items", []))
         if has_id:
             log("Идентификаторы найдены.")
@@ -355,15 +371,11 @@ def analyze_with_qwen(full_text, model):
             payload["messages"][1]["content"] = f"""Ты не вытащил технические термины! Найди их и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
 Патч-ноут:
 {full_text}"""
-            # Повторяем запрос с тем же источником (OpenRouter или Groq)
-            if result.get("source") == "groq":
-                result2 = send_to_groq(payload)
-            else:
-                result2 = send_request(payload, model)
+            result2 = send_request(payload)
             return result2 if result2 else result
     return None
 
-# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD (с исправленными изображениями) ----------
+# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD ----------
 def format_message(game, title, link, raw_text, model):
     game_name = GAME_NAMES.get(game, game)
     version_match = re.search(r'(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)', title)
@@ -420,16 +432,21 @@ def send_to_discord(game, title, link, raw_text):
     if not webhook:
         log(f"Вебхук для {game} не настроен")
         return
+
+    # Проверяем, не обработана ли уже новость
     if is_processed(game, title):
         log(f"Новость уже обработана: {title}")
         return
 
-    model = MODELS.get(game, "nvidia/nemotron-3-ultra-550b-a55b:free")
+    log(f"Новая новость: {game}|{title}")
+
+    model = MODELS.get(game, OR_MODELS[0])  # используем первую модель как заглушку
     text_messages, image_urls = format_message(game, title, link, raw_text, model)
     if not text_messages:
         log(f"Нет сообщений для отправки ({title})")
         return
 
+    # Помечаем новость как обработанную ПЕРЕД отправкой
     mark_processed(game, title)
 
     # Отправка текстовых сообщений
@@ -447,22 +464,17 @@ def send_to_discord(game, title, link, raw_text):
             log(f"Ошибка отправки текста в Discord: {e}")
         time.sleep(2)
 
-    # Отправка изображений (War Thunder) через embed
+    # Отправка изображений (War Thunder)
     if image_urls and game == "warthunder":
         log(f"Отправка {len(image_urls)} изображений для {game}")
-        # Отправляем по одному изображению в embed
-        for idx, url in enumerate(image_urls[:10]):  # ограничим 10, чтобы не флудить
+        for idx, url in enumerate(image_urls[:10]):
             embed = {
                 "title": "📷 Изображение из новости",
                 "image": {"url": url},
                 "color": 0x00ff00,
                 "footer": {"text": f"Изображение {idx+1} из {len(image_urls)}"}
             }
-            payload = {
-                "content": "",
-                "embeds": [embed],
-                "allowed_mentions": {"parse": []}
-            }
+            payload = {"embeds": [embed], "allowed_mentions": {"parse": []}}
             try:
                 r = requests.post(webhook, json=payload)
                 if r.status_code == 204:
@@ -472,8 +484,6 @@ def send_to_discord(game, title, link, raw_text):
             except Exception as e:
                 log(f"Ошибка отправки изображения {idx+1}: {e}")
             time.sleep(1)
-
-        # Если изображений больше 10, отправляем ссылки текстом
         if len(image_urls) > 10:
             extra_urls = image_urls[10:]
             links_text = "📷 **Дополнительные изображения:**\n" + "\n".join(extra_urls[:10])
