@@ -47,7 +47,7 @@ RSS_FEEDS = {
     "rust": "https://rust.facepunch.com/rss",
     "garrysmod": "https://store.steampowered.com/feeds/news/app/4000/",
     "unturned": "https://store.steampowered.com/feeds/news/app/304930/",
-    "sbox": "https://sbox.facepunch.com/news/rss",
+    "sbox": "https://sbox.game/news/rss",
     "warthunder": "https://warthunder.com/en/rss/news/"
 }
 
@@ -156,8 +156,8 @@ def fetch_full_article(url, game=None):
             tag.decompose()
 
         content = None
-        if "facepunch.com" in url:
-            content = soup.find("div", class_="blog") or soup.find("div", class_="post-content")
+        if "facepunch.com" in url or "sbox.game" in url:
+            content = soup.find("div", class_="blog") or soup.find("div", class_="post-content") or soup.find("article")
         elif "warthunder.com" in url:
             content = soup.find("div", class_="news-text") or soup.find("div", class_="content")
         elif "steampowered.com" in url:
@@ -200,33 +200,51 @@ def fetch_full_article(url, game=None):
 # ---------- ПАРСИНГ HTML ДЛЯ sbox ----------
 def fetch_sbox_news_from_html():
     try:
-        url = "https://sbox.facepunch.com/news/"
+        url = "https://sbox.game/news/"
         log(f"Парсинг HTML новостей sbox: {url}")
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
+            log(f"Ошибка загрузки страницы sbox: {r.status_code}")
             return None
         soup = BeautifulSoup(r.text, "html.parser")
+
+        # 1. Ищем все ссылки на /news/
         candidates = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/news/" in href and not href.endswith("/news/"):
+                title = a.get_text(strip=True)
+                if not title:
+                    parent = a.find_parent()
+                    if parent:
+                        heading = parent.find(["h1", "h2", "h3"])
+                        if heading:
+                            title = heading.get_text(strip=True)
+                if title and len(title) > 5:
+                    if href.startswith("/"):
+                        href = "https://sbox.game" + href
+                    elif href.startswith("./"):
+                        href = "https://sbox.game" + href[1:]
+                    candidates.append({"title": title, "link": href})
+
+        if candidates:
+            log(f"Найдена новость через ссылку: {candidates[0]['title']}")
+            return candidates[0]
+
+        # 2. Если не нашли через ссылки, ищем любой блок с текстом > 300 символов
         for tag in soup.find_all(["div", "article", "section"]):
             text = tag.get_text(strip=True)
-            if len(text) > 200:
-                link_tag = tag.find("a", href=True)
+            if len(text) > 300:
+                link_tag = tag.find("a", href=re.compile(r"/news/"))
                 if link_tag:
                     href = link_tag["href"]
                     if href.startswith("/"):
-                        href = "https://sbox.facepunch.com" + href
+                        href = "https://sbox.game" + href
                     title_tag = tag.find("h1") or tag.find("h2") or tag.find("h3") or link_tag
                     title = title_tag.get_text(strip=True) if title_tag else "Новость sbox"
-                    candidates.append({"title": title, "link": href})
-        if candidates:
-            return candidates[0]
-        for a in soup.find_all("a", href=re.compile(r"/news/")):
-            if a.get_text(strip=True):
-                title = a.get_text(strip=True)
-                href = a["href"]
-                if href.startswith("/"):
-                    href = "https://sbox.facepunch.com" + href
-                return {"title": title, "link": href}
+                    log(f"Найдена новость через блок: {title}")
+                    return {"title": title, "link": href}
+
         log("Не удалось найти новости на HTML-странице sbox")
         return None
     except Exception as e:
