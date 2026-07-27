@@ -17,16 +17,22 @@ app = Flask(__name__)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Основная модель OpenRouter (рекомендована)
+# Основная модель OpenRouter
 OR_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 # Groq API
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-# Основная модель Groq (рекомендована)
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# Для каждой игры используем одну и ту же модель (можно оставить для совместимости)
+# GitHub Models API
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_URL = "https://models.github.ai/inference/chat/completions"
+# Доступные модели: можно выбрать любую из списка:
+# https://github.com/marketplace/models
+GITHUB_MODEL = "openai/gpt-4.1"  # или "meta-llama/Llama-3.3-70B-Instruct", "deepseek/deepseek-v3"
+
+# Для каждой игры используем одну и ту же модель (оставлено для совместимости)
 MODELS = {
     "rust": OR_MODEL,
     "garrysmod": OR_MODEL,
@@ -231,35 +237,32 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 Если изменений нет: {"nothing_new": true, "reason": "причина на русском"}
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА С ПЕРЕКЛЮЧЕНИЕМ ----------
+# ---------- ОТПРАВКА ЗАПРОСА (OpenRouter → Groq → GitHub) ----------
 def send_request(payload, model):
-    """Отправляет запрос в OpenRouter. При ошибке переключается на Groq."""
+    """Пытается отправить запрос: OpenRouter → Groq → GitHub Models."""
     rate_limiter.wait_if_needed()
 
+    # 1. Пробуем OpenRouter
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     payload_copy = payload.copy()
     payload_copy["model"] = model
-
-    # Попытка через OpenRouter
     try:
         log(f"Пробуем OpenRouter модель: {model}")
         r = requests.post(OPENROUTER_URL, headers=headers, json=payload_copy, timeout=120)
         if r.status_code == 429:
-            wait = 5
-            log(f"OpenRouter лимит, ждём {wait}с...")
-            time.sleep(wait)
+            log("OpenRouter лимит, ждём 5с...")
+            time.sleep(5)
             r = requests.post(OPENROUTER_URL, headers=headers, json=payload_copy, timeout=120)
             if r.status_code != 200:
-                log(f"OpenRouter всё ещё недоступна, переключаемся на Groq")
+                log("OpenRouter всё ещё недоступна, переключаемся на Groq")
                 return send_to_groq(payload)
         if r.status_code != 200:
             log(f"OpenRouter ошибка: {r.status_code} {r.text[:300]}")
             return send_to_groq(payload)
         response_text = r.json()["choices"][0]["message"]["content"]
-        log(f"Успешный ответ от OpenRouter")
+        log("Успешный ответ от OpenRouter")
         match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if not match:
-            log("Не найден JSON, переключаемся на Groq")
             return send_to_groq(payload)
         json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
         json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
@@ -269,56 +272,99 @@ def send_request(payload, model):
         return send_to_groq(payload)
 
 def send_to_groq(payload):
-    """Отправляет запрос в Groq."""
-    if not GROQ_API_KEY:
-        log("GROQ_API_KEY не задан, невозможно использовать Groq")
+    """Отправляет запрос в Groq, при ошибке переключается на GitHub Models."""
+    if GROQ_API_KEY:
+        try:
+            log(f"Пробуем Groq модель: {GROQ_MODEL}")
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+            messages = payload.get("messages", [])
+            if not any(msg.get("role") == "system" for msg in messages):
+                messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+            groq_payload = {
+                "model": GROQ_MODEL,
+                "messages": messages,
+                "max_tokens": payload.get("max_tokens", 8000),
+                "temperature": payload.get("temperature", 0.1)
+            }
+            r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
+            if r.status_code == 429:
+                log("Groq лимит, ждём 5с...")
+                time.sleep(5)
+                r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
+                if r.status_code != 200:
+                    log("Groq недоступна, переключаемся на GitHub Models")
+                    return send_to_github(payload)
+            if r.status_code != 200:
+                log(f"Groq ошибка: {r.status_code} {r.text[:300]}")
+                return send_to_github(payload)
+            response_text = r.json()["choices"][0]["message"]["content"]
+            log("Успешный ответ от Groq")
+            match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if not match:
+                return send_to_github(payload)
+            json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
+            json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
+            return json.loads(json_str)
+        except Exception as e:
+            log(f"Groq ошибка: {e}")
+            return send_to_github(payload)
+    else:
+        return send_to_github(payload)
+
+def send_to_github(payload):
+    """Отправляет запрос в GitHub Models."""
+    if not GITHUB_TOKEN:
+        log("GITHUB_TOKEN не задан")
         return None
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    messages = payload.get("messages", [])
-    if not any(msg.get("role") == "system" for msg in messages):
-        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-
-    groq_payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "max_tokens": payload.get("max_tokens", 8000),
-        "temperature": payload.get("temperature", 0.1)
-    }
-
     try:
-        log(f"Пробуем Groq модель: {GROQ_MODEL}")
-        r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
+        log(f"Пробуем GitHub Models: {GITHUB_MODEL}")
+        messages = payload.get("messages", [])
+        if not any(msg.get("role") == "system" for msg in messages):
+            messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+
+        github_payload = {
+            "model": GITHUB_MODEL,
+            "messages": messages,
+            "max_tokens": payload.get("max_tokens", 8000),
+            "temperature": payload.get("temperature", 0.1)
+        }
+
+        headers = {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+
+        r = requests.post(GITHUB_URL, headers=headers, json=github_payload, timeout=120)
         if r.status_code == 429:
-            wait = 5
-            log(f"Groq лимит, ждём {wait}с...")
-            time.sleep(wait)
-            r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
+            log("GitHub Models лимит, ждём 5с...")
+            time.sleep(5)
+            r = requests.post(GITHUB_URL, headers=headers, json=github_payload, timeout=120)
             if r.status_code != 200:
-                log(f"Groq недоступна")
+                log(f"GitHub Models ошибка: {r.status_code} {r.text[:300]}")
                 return None
         if r.status_code != 200:
-            log(f"Groq ошибка: {r.status_code} {r.text[:300]}")
+            log(f"GitHub Models ошибка: {r.status_code} {r.text[:300]}")
             return None
+
         response_text = r.json()["choices"][0]["message"]["content"]
-        log(f"Успешный ответ от Groq")
+        log("Успешный ответ от GitHub Models")
         match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if not match:
-            log("Не найден JSON в ответе Groq")
+            log("Не найден JSON в ответе GitHub Models")
             return None
         json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
         json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
         return json.loads(json_str)
     except Exception as e:
-        log(f"Groq ошибка: {e}")
+        log(f"GitHub Models ошибка: {e}")
         return None
 
 def analyze_with_qwen(full_text, model):
-    if not OPENROUTER_API_KEY and not GROQ_API_KEY:
-        log("Нет API-ключей")
+    if not OPENROUTER_API_KEY and not GROQ_API_KEY and not GITHUB_TOKEN:
+        log("Нет API-ключей (OpenRouter, Groq, GitHub)")
         return None
 
     user_prompt = f"""Проанализируй патч-ноут. Вытащи ВСЕ технические термины (команды, консольные переменные, префабы, хуки, методы, классы) и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
