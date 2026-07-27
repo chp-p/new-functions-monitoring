@@ -17,38 +17,23 @@ app = Flask(__name__)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Основная модель OpenRouter (рекомендована)
+OR_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+
 # Groq API
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+# Основная модель Groq (рекомендована)
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# Список моделей Groq (перебираются по порядку, только если OpenRouter не сработал)
-GROQ_MODELS = [
-    "groq/compound",
-    "llama-3.3-70b-versatile",
-    "qwen/qwen3.6-27b",
-    "openai/gpt-oss-120b",
-    "groq/compound-mini"
-]
-
-# OpenRouter модели (для каждой игры, но мы будем перебирать все)
+# Для каждой игры используем одну и ту же модель (можно оставить для совместимости)
 MODELS = {
-    "rust": "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "garrysmod": "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "unturned": "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "sbox": "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "warthunder": "nvidia/nemotron-3-ultra-550b-a55b:free"
+    "rust": OR_MODEL,
+    "garrysmod": OR_MODEL,
+    "unturned": OR_MODEL,
+    "sbox": OR_MODEL,
+    "warthunder": OR_MODEL
 }
-
-# Список моделей OpenRouter (перебираются по порядку, только если предыдущая не сработала)
-OR_MODELS = [
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "google/gemma-4-31b-it:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "cohere/north-mini-code:free",
-    "openai/gpt-oss-20b:free",
-    "nvidia/nemotron-3-nano-30b-a3b:free"
-]
 
 WEBHOOKS = {
     "rust": os.environ.get("WEBHOOK_RUST", ""),
@@ -86,6 +71,8 @@ if SUPABASE_URL and SUPABASE_KEY:
         test = supabase.table("processed_news").select("*").limit(1).execute()
         SUPABASE_ENABLED = True
         print("✅ Supabase подключен, таблица существует.")
+        print("ℹ️ Если видите ошибки RLS, выполните в SQL Editor:")
+        print("ALTER TABLE processed_news DISABLE ROW LEVEL SECURITY;")
     except Exception as e:
         print(f"⚠️ Ошибка подключения к Supabase: {e}")
         SUPABASE_ENABLED = False
@@ -118,6 +105,7 @@ def is_processed(game, title):
                 return True
         except Exception as e:
             log(f"Ошибка запроса к Supabase: {e}")
+    # fallback на файл
     CACHE_FILE = "/tmp/processed_news.txt"
     if not os.path.exists(CACHE_FILE):
         return False
@@ -243,59 +231,47 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 Если изменений нет: {"nothing_new": true, "reason": "причина на русском"}
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА (сначала пробуем первую рабочую модель, переключаемся только при ошибках) ----------
-def send_request(payload):
-    """Пытается отправить запрос: сначала OpenRouter с первой моделью, если ошибка – перебирает остальные.
-    Если все OpenRouter не сработали – переходит к Groq."""
+# ---------- ОТПРАВКА ЗАПРОСА С ПЕРЕКЛЮЧЕНИЕМ ----------
+def send_request(payload, model):
+    """Отправляет запрос в OpenRouter. При ошибке переключается на Groq."""
+    rate_limiter.wait_if_needed()
+
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+    payload_copy = payload.copy()
+    payload_copy["model"] = model
 
-    # 1. Пробуем OpenRouter модели по порядку, но останавливаемся на первой успешной
-    for or_model in OR_MODELS:
-        log(f"Пробуем OpenRouter модель: {or_model}")
-        payload_copy = payload.copy()
-        payload_copy["model"] = or_model
-
-        # Делаем только одну попытку без повторных (кроме 429)
-        try:
+    # Попытка через OpenRouter
+    try:
+        log(f"Пробуем OpenRouter модель: {model}")
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload_copy, timeout=120)
+        if r.status_code == 429:
+            wait = 5
+            log(f"OpenRouter лимит, ждём {wait}с...")
+            time.sleep(wait)
             r = requests.post(OPENROUTER_URL, headers=headers, json=payload_copy, timeout=120)
-            if r.status_code == 429:
-                wait = 5
-                log(f"OpenRouter {or_model} лимит, ждём {wait}с...")
-                time.sleep(wait)
-                # После ожидания пробуем ещё раз ту же модель
-                r = requests.post(OPENROUTER_URL, headers=headers, json=payload_copy, timeout=120)
-                if r.status_code != 200:
-                    log(f"OpenRouter {or_model} всё ещё недоступна, переходим к следующей")
-                    continue
             if r.status_code != 200:
-                log(f"OpenRouter {or_model} ошибка: {r.status_code} {r.text[:300]}")
-                continue  # переходим к следующей модели
-
-            response_text = r.json()["choices"][0]["message"]["content"]
-            log(f"Успешный ответ от OpenRouter ({or_model})")
-            match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if not match:
-                log("Не найден JSON в ответе OpenRouter, пробуем следующую модель")
-                continue
-            json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
-            json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
-            return json.loads(json_str)
-        except Exception as e:
-            log(f"OpenRouter {or_model} ошибка: {e}")
-            continue
-
-    # 2. Если все OpenRouter не сработали, пробуем Groq
-    if GROQ_API_KEY:
-        log("Все OpenRouter модели исчерпаны, пробуем Groq...")
+                log(f"OpenRouter всё ещё недоступна, переключаемся на Groq")
+                return send_to_groq(payload)
+        if r.status_code != 200:
+            log(f"OpenRouter ошибка: {r.status_code} {r.text[:300]}")
+            return send_to_groq(payload)
+        response_text = r.json()["choices"][0]["message"]["content"]
+        log(f"Успешный ответ от OpenRouter")
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not match:
+            log("Не найден JSON, переключаемся на Groq")
+            return send_to_groq(payload)
+        json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
+        json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
+        return json.loads(json_str)
+    except Exception as e:
+        log(f"OpenRouter ошибка: {e}")
         return send_to_groq(payload)
 
-    log("Все модели исчерпаны")
-    return None
-
 def send_to_groq(payload):
-    """Перебирает модели Groq по порядку, останавливается на первой успешной."""
+    """Отправляет запрос в Groq."""
     if not GROQ_API_KEY:
-        log("GROQ_API_KEY не задан")
+        log("GROQ_API_KEY не задан, невозможно использовать Groq")
         return None
 
     headers = {
@@ -306,40 +282,39 @@ def send_to_groq(payload):
     if not any(msg.get("role") == "system" for msg in messages):
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-    for groq_model in GROQ_MODELS:
-        log(f"Пробуем Groq модель: {groq_model}")
-        groq_payload = {
-            "model": groq_model,
-            "messages": messages,
-            "max_tokens": payload.get("max_tokens", 8000),
-            "temperature": payload.get("temperature", 0.1)
-        }
-        try:
+    groq_payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "max_tokens": payload.get("max_tokens", 8000),
+        "temperature": payload.get("temperature", 0.1)
+    }
+
+    try:
+        log(f"Пробуем Groq модель: {GROQ_MODEL}")
+        r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
+        if r.status_code == 429:
+            wait = 5
+            log(f"Groq лимит, ждём {wait}с...")
+            time.sleep(wait)
             r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
-            if r.status_code == 429:
-                wait = 5
-                log(f"Groq {groq_model} лимит, ждём {wait}с...")
-                time.sleep(wait)
-                r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
-                if r.status_code != 200:
-                    log(f"Groq {groq_model} всё ещё недоступна, переходим к следующей")
-                    continue
             if r.status_code != 200:
-                log(f"Groq {groq_model} ошибка: {r.status_code} {r.text[:300]}")
-                continue
-            response_text = r.json()["choices"][0]["message"]["content"]
-            log(f"Успешный ответ от Groq ({groq_model})")
-            match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if not match:
-                log("Не найден JSON в ответе Groq, пробуем следующую модель")
-                continue
-            json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
-            json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
-            return json.loads(json_str)
-        except Exception as e:
-            log(f"Groq {groq_model} ошибка: {e}")
-            continue
-    return None
+                log(f"Groq недоступна")
+                return None
+        if r.status_code != 200:
+            log(f"Groq ошибка: {r.status_code} {r.text[:300]}")
+            return None
+        response_text = r.json()["choices"][0]["message"]["content"]
+        log(f"Успешный ответ от Groq")
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not match:
+            log("Не найден JSON в ответе Groq")
+            return None
+        json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
+        json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
+        return json.loads(json_str)
+    except Exception as e:
+        log(f"Groq ошибка: {e}")
+        return None
 
 def analyze_with_qwen(full_text, model):
     if not OPENROUTER_API_KEY and not GROQ_API_KEY:
@@ -358,9 +333,7 @@ def analyze_with_qwen(full_text, model):
         "temperature": 0.1
     }
 
-    # Пробуем все модели (перебор только при ошибках)
-    result = send_request(payload)
-
+    result = send_request(payload, model)
     if result:
         has_id = any(re.search(r'\([^)]+\)', item) for sec in result.get("sections", []) for item in sec.get("items", []))
         if has_id:
@@ -371,7 +344,7 @@ def analyze_with_qwen(full_text, model):
             payload["messages"][1]["content"] = f"""Ты не вытащил технические термины! Найди их и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
 Патч-ноут:
 {full_text}"""
-            result2 = send_request(payload)
+            result2 = send_request(payload, model)
             return result2 if result2 else result
     return None
 
@@ -439,7 +412,7 @@ def send_to_discord(game, title, link, raw_text):
 
     log(f"Новая новость: {game}|{title}")
 
-    model = MODELS.get(game, OR_MODELS[0])
+    model = MODELS.get(game, OR_MODEL)
     text_messages, image_urls = format_message(game, title, link, raw_text, model)
     if not text_messages:
         log(f"Нет сообщений для отправки ({title})")
