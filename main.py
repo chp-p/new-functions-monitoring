@@ -9,6 +9,7 @@ import json
 import feedparser
 from flask import Flask
 from bs4 import BeautifulSoup
+from supabase import create_client, Client
 
 app = Flask(__name__)
 
@@ -19,10 +20,10 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Модели для каждой игры
 MODELS = {
     "rust": "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "garrysmod": "nvidia/nemotron-3-super-120b-a12b:free",
-    "unturned": "inclusionai/ling-3.0-flash:free",
-    "sbox": "poolside/laguna-s-2.1:free",
-    "warthunder": "nvidia/nemotron-3-super-120b-a12b:free"
+    "garrysmod": "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "unturned": "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "sbox": "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "warthunder": "nvidia/nemotron-3-ultra-550b-a55b:free"
 }
 
 # Запасные модели при ошибках
@@ -56,16 +57,45 @@ GAME_NAMES = {
     "warthunder": "War Thunder"
 }
 
-CACHE_FILE = "/tmp/processed_news.txt"
+# ---------- SUPABASE ПОДКЛЮЧЕНИЕ ----------
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+supabase: Client = None
+
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        # Проверяем подключение и создаём таблицу, если её нет
+        try:
+            # Пробуем выполнить запрос к таблице
+            supabase.table("processed_news").select("*").limit(1).execute()
+            print("✅ Supabase подключен, таблица существует.")
+        except Exception as e:
+            if "relation" in str(e) and "does not exist" in str(e):
+                print("⚠️ Таблица processed_news не найдена.")
+                print("📝 Пожалуйста, создайте её через SQL Editor в Supabase:")
+                print("""
+CREATE TABLE processed_news (
+    id BIGSERIAL PRIMARY KEY,
+    game TEXT NOT NULL,
+    title TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(game, title)
+);
+                """)
+            else:
+                print(f"⚠️ Ошибка подключения к Supabase: {e}")
+    except Exception as e:
+        print(f"⚠️ Не удалось подключиться к Supabase: {e}")
+        supabase = None
+else:
+    print("⚠️ SUPABASE_URL или SUPABASE_KEY не заданы, используется файловый кеш.")
 
 # ---------- УЛУЧШЕННЫЙ ОГРАНИЧИТЕЛЬ ЧАСТОТЫ (не более 1 запроса в 3.5 секунды) ----------
 class RateLimiter:
     def __init__(self, requests_per_minute=17):
-        # 17 запросов в минуту — запас, чтобы точно не превысить 20
         self.interval = 60.0 / requests_per_minute  # ≈ 3.5 секунды
         self.last_request_time = 0
-        self.lock = threading.Lock()
-        self.lock = None  # временно убираем threading для простоты
 
     def wait_if_needed(self):
         now = time.time()
@@ -77,12 +107,20 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(requests_per_minute=17)
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
-def log(msg):
-    print(msg, flush=True)
-    sys.stdout.flush()
-
+# ---------- ФУНКЦИИ РАБОТЫ С БАЗОЙ ДАННЫХ ----------
 def is_processed(game, title):
+    """Проверяет, обрабатывалась ли уже новость (сначала Supabase, потом файл)."""
+    if supabase:
+        try:
+            response = supabase.table("processed_news").select("*").eq("game", game).eq("title", title).execute()
+            return len(response.data) > 0
+        except Exception as e:
+            print(f"Ошибка проверки в Supabase: {e}")
+            # При ошибке Supabase падаем на файловый кеш
+            pass
+    
+    # Файловый кеш (для обратной совместимости)
+    CACHE_FILE = "/tmp/processed_news.txt"
     if not os.path.exists(CACHE_FILE):
         return False
     try:
@@ -93,13 +131,30 @@ def is_processed(game, title):
         return False
 
 def mark_processed(game, title):
+    """Записывает новость как обработанную (сначала Supabase, потом файл)."""
+    if supabase:
+        try:
+            supabase.table("processed_news").insert({"game": game, "title": title}).execute()
+            return
+        except Exception as e:
+            print(f"Ошибка записи в Supabase: {e}")
+            # При ошибке Supabase падаем на файловый кеш
+            pass
+    
+    # Файловый кеш (для обратной совместимости)
+    CACHE_FILE = "/tmp/processed_news.txt"
     try:
         with open(CACHE_FILE, "a", encoding="utf-8") as f:
             f.write(f"{game}|{title}\n")
     except Exception as e:
-        log(f"Ошибка записи в кеш: {e}")
+        print(f"Ошибка записи в файловый кеш: {e}")
 
-# ---------- ПАРСИНГ СТАТЕЙ (с извлечением изображений для War Thunder) ----------
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+def log(msg):
+    print(msg, flush=True)
+    sys.stdout.flush()
+
+# ---------- ПАРСИНГ СТАТЕЙ (с извлечением изображений) ----------
 def fetch_full_article(url, game=None):
     try:
         log(f"Загрузка статьи: {url}")
@@ -159,7 +214,6 @@ def fetch_full_article(url, game=None):
 
 # ---------- ПАРСИНГ WAR THUNDER ЧЕРЕЗ HTML (если RSS пуст) ----------
 def fetch_warthunder_news_from_html():
-    """Парсит список новостей с главной страницы War Thunder."""
     try:
         url = "https://warthunder.com/en/news/"
         log(f"Парсинг HTML новостей War Thunder: {url}")
@@ -168,14 +222,10 @@ def fetch_warthunder_news_from_html():
             log(f"Ошибка загрузки страницы новостей: {r.status_code}")
             return None
         soup = BeautifulSoup(r.text, "html.parser")
-        # Ищем блоки новостей
-        # Пробуем разные классы
         news_items = soup.find_all("div", class_=re.compile(r"news-item|news-block|news-card"))
         if not news_items:
-            # Ищем все ссылки, у которых href содержит '/en/news/'
             news_links = soup.find_all("a", href=re.compile(r"/en/news/"))
             if news_links:
-                # Берём первую ссылку, которая содержит текст
                 for link in news_links:
                     if link.get_text(strip=True):
                         title = link.get_text(strip=True)
@@ -223,9 +273,8 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов комп�
 
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА (с RateLimiter и fallback) ----------
+# ---------- ОТПРАВКА ЗАПРОСА ----------
 def send_request(payload, model):
-    # Применяем ограничитель частоты перед каждым запросом
     rate_limiter.wait_if_needed()
 
     headers = {
@@ -244,7 +293,6 @@ def send_request(payload, model):
                 continue
             if r.status_code != 200:
                 log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
-                # Пробуем запасную модель
                 if attempt < 2 and len(FALLBACK_MODELS) > attempt:
                     fallback_model = FALLBACK_MODELS[attempt]
                     log(f"Переключаемся на запасную модель: {fallback_model}")
@@ -445,7 +493,6 @@ def is_old(published_parsed):
 
 def process_game(game, url):
     try:
-        # Сначала пробуем RSS
         feed = feedparser.parse(url)
         entries = feed.entries
         if not entries:
@@ -479,10 +526,8 @@ def process_game(game, url):
 
 def check_feeds():
     log("Проверка RSS...")
-    # Обрабатываем игры последовательно, с паузой не менее 3 секунд между играми
     for game, url in RSS_FEEDS.items():
         process_game(game, url)
-        # Пауза между обработкой игр, чтобы дать API отдохнуть
         time.sleep(3.5)
 
 # ---------- FLASK ----------
