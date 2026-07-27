@@ -17,20 +17,16 @@ app = Flask(__name__)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Основная модель OpenRouter
 OR_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
-# GitHub Models API (теперь перед Groq)
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_URL = "https://models.github.ai/inference/chat/completions"
-GITHUB_MODEL = "openai/gpt-4.1"  # или "meta-llama/Llama-3.3-70B-Instruct"
+GITHUB_MODEL = "openai/gpt-4.1"
 
-# Groq API (теперь после GitHub)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# Для каждой игры используем одну и ту же модель (оставлено для совместимости)
 MODELS = {
     "rust": OR_MODEL,
     "garrysmod": OR_MODEL,
@@ -52,12 +48,8 @@ RSS_FEEDS = {
     "garrysmod": "https://store.steampowered.com/feeds/news/app/4000/",
     "unturned": "https://store.steampowered.com/feeds/news/app/304930/",
     "sbox": "https://sbox.facepunch.com/news/rss",
-    "warthunder": "https://warthunder.com/en/rss/news/"  # основные новости
+    "warthunder": "https://warthunder.com/en/rss/news/"
 }
-
-# Дополнительный RSS для devblog War Thunder (если есть)
-# Если нет отдельного, можно оставить пустым
-WARTHUNDER_DEVBLOG_RSS = "https://warthunder.com/en/devblog/rss/"  # может не работать
 
 GAME_NAMES = {
     "rust": "Rust",
@@ -103,9 +95,8 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(requests_per_minute=17)
 
-# ---------- ФУНКЦИИ БАЗЫ ДАННЫХ (с улучшенным fallback) ----------
+# ---------- ФУНКЦИИ БАЗЫ ДАННЫХ ----------
 def is_processed(game, title):
-    # Сначала пробуем Supabase
     if SUPABASE_ENABLED and supabase:
         try:
             resp = supabase.table("processed_news").select("*").eq("game", game).eq("title", title).execute()
@@ -114,12 +105,10 @@ def is_processed(game, title):
                 return True
         except Exception as e:
             log(f"Ошибка запроса к Supabase: {e}")
-    # fallback на файл (используем /tmp, но если не работает - в текущую директорию)
     try:
         CACHE_FILE = "/tmp/processed_news.txt"
-        # Проверяем, можем ли писать в /tmp
         if not os.access("/tmp", os.W_OK):
-            CACHE_FILE = "processed_news.txt"  # fallback в текущую папку
+            CACHE_FILE = "processed_news.txt"
         if not os.path.exists(CACHE_FILE):
             return False
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
@@ -133,7 +122,6 @@ def is_processed(game, title):
         return False
 
 def mark_processed(game, title):
-    # Сначала пробуем Supabase
     if SUPABASE_ENABLED and supabase:
         try:
             supabase.table("processed_news").upsert({"game": game, "title": title}, on_conflict="game,title").execute()
@@ -141,7 +129,6 @@ def mark_processed(game, title):
             return
         except Exception as e:
             log(f"Ошибка записи в Supabase: {e}")
-    # fallback на файл
     try:
         CACHE_FILE = "/tmp/processed_news.txt"
         if not os.access("/tmp", os.W_OK):
@@ -156,7 +143,7 @@ def log(msg):
     print(msg, flush=True)
     sys.stdout.flush()
 
-# ---------- ПАРСИНГ СТАТЕЙ (с улучшенным извлечением изображений) ----------
+# ---------- ПАРСИНГ СТАТЕЙ ----------
 def fetch_full_article(url, game=None):
     try:
         log(f"Загрузка статьи: {url}")
@@ -170,44 +157,38 @@ def fetch_full_article(url, game=None):
 
         content = None
         if "facepunch.com" in url:
-            content = soup.find("div", class_="blog")
+            content = soup.find("div", class_="blog") or soup.find("div", class_="post-content")
         elif "warthunder.com" in url:
             content = soup.find("div", class_="news-text") or soup.find("div", class_="content")
         elif "steampowered.com" in url:
             content = soup.find("div", class_="announcement_body") or soup.find("div", class_="news_post_content")
             if not content:
                 for div in soup.find_all("div"):
-                    if len(div.get_text(strip=True)) > 2000:
+                    if len(div.get_text(strip=True)) > 1000:
                         content = div
                         break
         else:
             content = soup.find("article") or soup.find("main") or soup.find("div", class_="content")
 
-        text = content.get_text(separator="\n", strip=True) if content else soup.get_text(separator="\n", strip=True)
+        if content:
+            text = content.get_text(separator="\n", strip=True)
+        else:
+            text = soup.get_text(separator="\n", strip=True)
+
         text = re.sub(r'\s+', ' ', text).strip()
         log(f"Загружено символов: {len(text)}")
 
-        # Извлечение изображений (расширенное для War Thunder)
         image_urls = []
         if game == "warthunder":
-            # Ищем все теги img
             for img in soup.find_all("img"):
-                src = img.get("src")
+                src = img.get("src") or img.get("data-src")
                 if src:
-                    # Преобразуем относительные ссылки в абсолютные
                     if src.startswith("//"):
                         src = "https:" + src
                     elif src.startswith("/"):
                         src = "https://warthunder.com" + src
-                    # Проверяем расширение
                     if re.search(r'\.(jpg|jpeg|png|gif|webp|bmp|svg)(\?.*)?$', src, re.I):
                         image_urls.append(src)
-            # Также ищем фоновые изображения (data-src, background-image)
-            for elem in soup.find_all(attrs={"data-src": True}):
-                src = elem["data-src"]
-                if src and src.startswith("http"):
-                    image_urls.append(src)
-            # Удаляем дубликаты
             image_urls = list(dict.fromkeys(image_urls))
             log(f"Найдено изображений: {len(image_urls)}")
 
@@ -215,6 +196,36 @@ def fetch_full_article(url, game=None):
     except Exception as e:
         log(f"Ошибка загрузки статьи: {e}")
         return "", []
+
+# ---------- ПАРСИНГ HTML ДЛЯ sbox (если RSS пуст) ----------
+def fetch_sbox_news_from_html():
+    try:
+        url = "https://sbox.facepunch.com/news/"
+        log(f"Парсинг HTML новостей sbox: {url}")
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        post = soup.find("div", class_="blog-post") or soup.find("article")
+        if not post:
+            for div in soup.find_all("div"):
+                if len(div.get_text(strip=True)) > 500:
+                    post = div
+                    break
+        if post:
+            title_tag = post.find("h1") or post.find("h2") or post.find("h3")
+            title = title_tag.get_text(strip=True) if title_tag else "Новость sbox"
+            link_tag = post.find("a", href=True)
+            if link_tag:
+                href = link_tag["href"]
+                if href.startswith("/"):
+                    href = "https://sbox.facepunch.com" + href
+                return {"title": title, "link": href}
+        log("Не удалось найти новости на HTML-странице sbox")
+        return None
+    except Exception as e:
+        log(f"Ошибка парсинга HTML sbox: {e}")
+        return None
 
 # ---------- HTML-ПАРСИНГ WAR THUNDER (если RSS пуст) ----------
 def fetch_warthunder_news_from_html():
@@ -225,8 +236,6 @@ def fetch_warthunder_news_from_html():
         if r.status_code != 200:
             return None
         soup = BeautifulSoup(r.text, "html.parser")
-        # Ищем новости
-        news_items = []
         for item in soup.find_all("div", class_=re.compile(r"news-item|news-block|news-card")):
             title_tag = item.find("h2") or item.find("h3") or item.find("a")
             if not title_tag:
@@ -237,22 +246,14 @@ def fetch_warthunder_news_from_html():
                 href = link_tag.get("href")
                 if href and href.startswith("/"):
                     href = "https://warthunder.com" + href
-                # Проверяем, является ли новость devblog
-                is_devblog = "devblog" in title.lower() or "dev blog" in title.lower()
-                news_items.append({"title": title, "link": href, "is_devblog": is_devblog})
-        # Сортируем: сначала основные новости, потом devblog
-        news_items.sort(key=lambda x: x["is_devblog"])  # False (основные) идут первыми
-        if news_items:
-            return news_items[0]  # возвращаем первую (самую приоритетную)
-        # Если не нашли через классы, ищем ссылки
+                return {"title": title, "link": href}
         for a in soup.find_all("a", href=re.compile(r"/en/news/")):
             if a.get_text(strip=True):
                 title = a.get_text(strip=True)
                 href = a.get("href")
                 if href and href.startswith("/"):
                     href = "https://warthunder.com" + href
-                is_devblog = "devblog" in title.lower()
-                return {"title": title, "link": href, "is_devblog": is_devblog}
+                return {"title": title, "link": href}
         log("Не удалось найти новости на HTML-странице War Thunder")
         return None
     except Exception as e:
@@ -271,10 +272,8 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 
 # ---------- ОТПРАВКА ЗАПРОСА (OpenRouter → GitHub → Groq) ----------
 def send_request(payload, model):
-    """Пытается отправить запрос: OpenRouter → GitHub → Groq."""
     rate_limiter.wait_if_needed()
 
-    # 1. Пробуем OpenRouter
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     payload_copy = payload.copy()
     payload_copy["model"] = model
@@ -304,31 +303,26 @@ def send_request(payload, model):
         return send_to_github(payload)
 
 def send_to_github(payload):
-    """Отправляет запрос в GitHub Models, при ошибке переключается на Groq."""
     if not GITHUB_TOKEN:
         log("GITHUB_TOKEN не задан, переключаемся на Groq")
         return send_to_groq(payload)
-
     try:
         log(f"Пробуем GitHub Models: {GITHUB_MODEL}")
         messages = payload.get("messages", [])
         if not any(msg.get("role") == "system" for msg in messages):
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-
         github_payload = {
             "model": GITHUB_MODEL,
             "messages": messages,
             "max_tokens": payload.get("max_tokens", 8000),
             "temperature": payload.get("temperature", 0.1)
         }
-
         headers = {
             "Authorization": f"Bearer {GITHUB_TOKEN}",
             "Content-Type": "application/json",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28"
         }
-
         r = requests.post(GITHUB_URL, headers=headers, json=github_payload, timeout=120)
         if r.status_code == 429:
             log("GitHub Models лимит, ждём 5с...")
@@ -340,7 +334,6 @@ def send_to_github(payload):
         if r.status_code != 200:
             log(f"GitHub Models ошибка: {r.status_code} {r.text[:300]}")
             return send_to_groq(payload)
-
         response_text = r.json()["choices"][0]["message"]["content"]
         log("Успешный ответ от GitHub Models")
         match = re.search(r'\{.*\}', response_text, re.DOTALL)
@@ -355,11 +348,9 @@ def send_to_github(payload):
         return send_to_groq(payload)
 
 def send_to_groq(payload):
-    """Отправляет запрос в Groq."""
     if not GROQ_API_KEY:
         log("GROQ_API_KEY не задан")
         return None
-
     try:
         log(f"Пробуем Groq модель: {GROQ_MODEL}")
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
@@ -514,10 +505,8 @@ def send_to_discord(game, title, link, raw_text):
             log(f"Ошибка отправки в Discord: {e}")
         time.sleep(2)
 
-    # Улучшенная отправка изображений (War Thunder)
     if image_urls and game == "warthunder":
         log(f"Отправка {len(image_urls)} изображений для {game}")
-        # Сначала пробуем отправить как embed
         for idx, url in enumerate(image_urls[:10]):
             embed = {
                 "title": "📷 Изображение из новости",
@@ -531,21 +520,17 @@ def send_to_discord(game, title, link, raw_text):
                 if r.status_code == 204:
                     log(f"Отправлено изображение {idx+1} (embed): {url}")
                 else:
-                    # Если embed не работает, отправляем как ссылку
-                    log(f"Embed не сработал, отправляем как ссылку: {url}")
+                    log(f"Не удалось отправить embed, отправляем ссылкой: {url}")
                     link_payload = {"content": f"📷 <{url}>", "allowed_mentions": {"parse": []}}
                     requests.post(webhook, json=link_payload)
             except Exception as e:
                 log(f"Ошибка отправки изображения {idx+1}: {e}")
-                # Fallback: отправляем ссылку
                 try:
                     link_payload = {"content": f"📷 <{url}>", "allowed_mentions": {"parse": []}}
                     requests.post(webhook, json=link_payload)
                 except:
                     pass
             time.sleep(1)
-
-        # Если изображений больше 10, отправляем ссылки
         if len(image_urls) > 10:
             extra_urls = image_urls[10:]
             links_text = "📷 **Дополнительные изображения:**\n" + "\n".join(extra_urls[:10])
@@ -559,7 +544,7 @@ def send_to_discord(game, title, link, raw_text):
             except Exception as e:
                 log(f"Ошибка отправки дополнительных ссылок: {e}")
 
-# ---------- RSS (с приоритетом для War Thunder) ----------
+# ---------- RSS (с поддержкой 2 последних статей и игнорированием возраста для Garry's Mod) ----------
 def is_old(published_parsed):
     if not published_parsed:
         return False
@@ -574,8 +559,18 @@ def process_game(game, url):
         feed = feedparser.parse(url)
         entries = feed.entries
         if not entries:
-            if game == "warthunder":
-                log("RSS War Thunder пуст, пробуем HTML...")
+            log(f"RSS для {game} пуст")
+            if game == "sbox":
+                log("Пробуем получить новости sbox через HTML...")
+                news = fetch_sbox_news_from_html()
+                if news:
+                    title, link = news.get("title"), news.get("link")
+                    log(f"Обработка {game} (из HTML): {title}")
+                    send_to_discord(game, title, link, "")
+                else:
+                    log(f"Не удалось получить новости для {game}")
+            elif game == "warthunder":
+                log("Пробуем получить новости War Thunder через HTML...")
                 news = fetch_warthunder_news_from_html()
                 if news:
                     title, link = news.get("title"), news.get("link")
@@ -586,22 +581,29 @@ def process_game(game, url):
             else:
                 log(f"Нет записей в {game}")
             return
-        entry = entries[0]
-        if is_old(entry.get("published_parsed")):
-            log(f"Новость старая: {entry.get('title')}")
-            return
-        title = entry.get("title", "Без названия")
-        link = entry.get("link", "")
-        raw = entry.get("summary", entry.get("description", ""))
-        log(f"Обработка {game} (из RSS): {title}")
-        send_to_discord(game, title, link, raw)
+
+        # Берем до 2 последних записей
+        max_entries = min(2, len(entries))
+        for i in range(max_entries):
+            entry = entries[i]
+            # Для Garry's Mod игнорируем возраст
+            if game == "garrysmod":
+                # Пропускаем проверку is_old
+                pass
+            else:
+                if is_old(entry.get("published_parsed")):
+                    log(f"Новость старая (пропускаем): {entry.get('title')}")
+                    continue
+            title = entry.get("title", "Без названия")
+            link = entry.get("link", "")
+            raw = entry.get("summary", entry.get("description", ""))
+            log(f"Обработка {game} (из RSS, #{i+1}): {title}")
+            send_to_discord(game, title, link, raw)
     except Exception as e:
         log(f"Ошибка обработки для {game}: {e}")
 
 def check_feeds():
     log("Проверка RSS...")
-    # Сначала обрабатываем War Thunder (основные новости)
-    # Затем другие игры
     order = ["warthunder", "garrysmod", "unturned", "sbox", "rust"]
     for game in order:
         url = RSS_FEEDS.get(game)
