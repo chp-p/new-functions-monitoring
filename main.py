@@ -17,7 +17,12 @@ app = Flask(__name__)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Единая модель для всех игр
+# Groq API
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"   # основная модель Groq
+
+# OpenRouter модели (для всех игр)
 MODELS = {
     "rust": "nvidia/nemotron-3-ultra-550b-a55b:free",
     "garrysmod": "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -26,11 +31,11 @@ MODELS = {
     "warthunder": "nvidia/nemotron-3-ultra-550b-a55b:free"
 }
 
-# Запасные модели при ошибках
+# Запасные модели при ошибках (сначала OpenRouter fallback, потом Groq)
 FALLBACK_MODELS = [
-    "qwen/qwen-2.5-72b-instruct:free",
-    "google/gemma-4-31b-it:free",
-    "deepseek/deepseek-v4-flash:free"
+    "qwen/qwen-2.5-72b-instruct:free",   # OpenRouter
+    "google/gemma-4-31b-it:free",        # OpenRouter
+    "deepseek/deepseek-v4-flash:free",   # OpenRouter
 ]
 
 WEBHOOKS = {
@@ -210,9 +215,11 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 Если изменений нет: {"nothing_new": true, "reason": "причина на русском"}
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА ----------
+# ---------- ОТПРАВКА ЗАПРОСА (с переключением на Groq) ----------
 def send_request(payload, model):
     rate_limiter.wait_if_needed()
+    
+    # Пробуем сначала OpenRouter с указанной моделью
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     payload["model"] = model
 
@@ -221,35 +228,90 @@ def send_request(payload, model):
             r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
             if r.status_code == 429:
                 wait = 2 ** (attempt + 1)
-                log(f"Превышен лимит для {model}, ждём {wait}с...")
+                log(f"Превышен лимит OpenRouter для {model}, ждём {wait}с...")
                 time.sleep(wait)
                 continue
             if r.status_code != 200:
                 log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
+                # Если модель недоступна, пробуем следующую из FALLBACK_MODELS (OpenRouter)
                 if attempt < len(FALLBACK_MODELS):
                     fallback = FALLBACK_MODELS[attempt]
-                    log(f"Переключаемся на {fallback}")
+                    log(f"Переключаемся на OpenRouter запасную: {fallback}")
                     payload["model"] = fallback
                     continue
+                # Если все OpenRouter модели исчерпаны, пробуем Groq
+                if GROQ_API_KEY and attempt >= len(FALLBACK_MODELS):
+                    log("Все модели OpenRouter исчерпаны, переключаемся на Groq")
+                    return send_to_groq(payload)
                 return None
             response_text = r.json()["choices"][0]["message"]["content"]
-            log(f"Получен ответ модели (символов: {len(response_text)})")
+            log(f"Получен ответ от OpenRouter (символов: {len(response_text)})")
             match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if not match:
-                log("Не найден JSON")
+                log("Не найден JSON в ответе OpenRouter")
                 return None
             json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
             json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
             return json.loads(json_str)
         except Exception as e:
-            log(f"Попытка {attempt+1} ошибка: {e}")
+            log(f"Попытка OpenRouter {attempt+1} ошибка: {e}")
+            time.sleep(2 ** attempt)
+    return None
+
+def send_to_groq(payload):
+    """Отправляет запрос в Groq (использует системный промпт из payload)."""
+    if not GROQ_API_KEY:
+        log("GROQ_API_KEY не задан, невозможно использовать Groq")
+        return None
+    
+    # Формируем сообщения для Groq (они совместимы с OpenAI)
+    messages = payload.get("messages", [])
+    # Добавляем системный промпт (если его нет)
+    if not any(msg.get("role") == "system" for msg in messages):
+        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+    
+    groq_payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "max_tokens": payload.get("max_tokens", 8000),
+        "temperature": payload.get("temperature", 0.1)
+    }
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    for attempt in range(3):
+        try:
+            log(f"Отправка запроса в Groq (модель: {GROQ_MODEL})")
+            r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
+            if r.status_code == 429:
+                wait = 2 ** (attempt + 1)
+                log(f"Превышен лимит Groq, ждём {wait}с...")
+                time.sleep(wait)
+                continue
+            if r.status_code != 200:
+                log(f"Ошибка Groq: {r.status_code} {r.text[:300]}")
+                return None
+            response_text = r.json()["choices"][0]["message"]["content"]
+            log(f"Получен ответ от Groq (символов: {len(response_text)})")
+            match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if not match:
+                log("Не найден JSON в ответе Groq")
+                return None
+            json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
+            json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
+            return json.loads(json_str)
+        except Exception as e:
+            log(f"Попытка Groq {attempt+1} ошибка: {e}")
             time.sleep(2 ** attempt)
     return None
 
 def analyze_with_qwen(full_text, model):
-    if not OPENROUTER_API_KEY:
-        log("Нет API-ключа")
+    if not OPENROUTER_API_KEY and not GROQ_API_KEY:
+        log("Нет API-ключей (ни OpenRouter, ни Groq)")
         return None
+
     user_prompt = f"""Проанализируй патч-ноут. Вытащи ВСЕ технические термины (команды, консольные переменные, префабы, хуки, методы, классы) и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
 Патч-ноут:
 {full_text}"""
@@ -261,20 +323,42 @@ def analyze_with_qwen(full_text, model):
         "max_tokens": 8000,
         "temperature": 0.1
     }
+
+    # Сначала пробуем OpenRouter с указанной моделью
     result = send_request(payload, model)
     if result:
+        # Проверяем наличие идентификаторов
         has_id = any(re.search(r'\([^)]+\)', item) for sec in result.get("sections", []) for item in sec.get("items", []))
         if has_id:
-            log("Идентификаторы найдены.")
+            log("Идентификаторы найдены (OpenRouter).")
             return result
         else:
-            log("Идентификаторы не найдены, повторный запрос с требованием")
+            log("Идентификаторы не найдены, повторный запрос с требованием (OpenRouter)")
             payload["messages"][1]["content"] = f"""Ты не вытащил технические термины! Найди их и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
 Патч-ноут:
 {full_text}"""
             result2 = send_request(payload, model)
             return result2 if result2 else result
-    return None
+    else:
+        # Если OpenRouter не удалось, пробуем Groq напрямую
+        if GROQ_API_KEY:
+            log("OpenRouter не ответил, пробуем Groq...")
+            result_groq = send_to_groq(payload)
+            if result_groq:
+                has_id_groq = any(re.search(r'\([^)]+\)', item) for sec in result_groq.get("sections", []) for item in sec.get("items", []))
+                if has_id_groq:
+                    log("Идентификаторы найдены (Groq).")
+                    return result_groq
+                else:
+                    log("Идентификаторы не найдены в Groq, повторный запрос с требованием")
+                    payload["messages"][1]["content"] = f"""Ты не вытащил технические термины! Найди их и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
+Патч-ноут:
+{full_text}"""
+                    result_groq2 = send_to_groq(payload)
+                    return result_groq2 if result_groq2 else result_groq
+            else:
+                log("Groq также не ответил.")
+        return None
 
 # ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD ----------
 def format_message(game, title, link, raw_text, model):
@@ -437,7 +521,7 @@ def check_feeds():
             process_game(game, url)
             time.sleep(3.5)
 
-# ---------- ЭНДПОИНТЫ ----------
+# ---------- FLASK ----------
 @app.route("/")
 def home():
     return "Monitor running"
@@ -446,27 +530,6 @@ def home():
 def check():
     check_feeds()
     return "OK"
-
-@app.route("/quota")
-def check_quota():
-    if not OPENROUTER_API_KEY:
-        return {"error": "API key not set"}, 400
-    try:
-        resp = requests.get(
-            "https://openrouter.ai/api/v1/key",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return {
-                "limit": data.get("limit"),
-                "remaining": data.get("limit_remaining"),
-                "daily_usage": data.get("usage_daily")
-            }
-        else:
-            return {"error": resp.text}, resp.status_code
-    except Exception as e:
-        return {"error": str(e)}, 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
