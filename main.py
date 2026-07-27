@@ -17,7 +17,7 @@ app = Flask(__name__)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Модели для каждой игры
+# Единая модель для всех игр
 MODELS = {
     "rust": "nvidia/nemotron-3-ultra-550b-a55b:free",
     "garrysmod": "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -57,7 +57,7 @@ GAME_NAMES = {
     "warthunder": "War Thunder"
 }
 
-# ---------- SUPABASE ПОДКЛЮЧЕНИЕ ----------
+# ---------- SUPABASE ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 supabase: Client = None
@@ -65,96 +65,60 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        # Проверяем подключение и создаём таблицу, если её нет
-        try:
-            # Пробуем выполнить запрос к таблице
-            supabase.table("processed_news").select("*").limit(1).execute()
-            print("✅ Supabase подключен, таблица существует.")
-        except Exception as e:
-            if "relation" in str(e) and "does not exist" in str(e):
-                print("⚠️ Таблица processed_news не найдена.")
-                print("📝 Пожалуйста, создайте её через SQL Editor в Supabase:")
-                print("""
-CREATE TABLE processed_news (
-    id BIGSERIAL PRIMARY KEY,
-    game TEXT NOT NULL,
-    title TEXT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(game, title)
-);
-                """)
-            else:
-                print(f"⚠️ Ошибка подключения к Supabase: {e}")
+        supabase.table("processed_news").select("*").limit(1).execute()
+        print("✅ Supabase подключен, таблица существует.")
     except Exception as e:
-        print(f"⚠️ Не удалось подключиться к Supabase: {e}")
+        print(f"⚠️ Ошибка Supabase: {e}")
         supabase = None
 else:
     print("⚠️ SUPABASE_URL или SUPABASE_KEY не заданы, используется файловый кеш.")
 
-# ---------- УЛУЧШЕННЫЙ ОГРАНИЧИТЕЛЬ ЧАСТОТЫ (не более 1 запроса в 3.5 секунды) ----------
+# ---------- ОГРАНИЧИТЕЛЬ ЧАСТОТЫ ----------
 class RateLimiter:
     def __init__(self, requests_per_minute=17):
-        self.interval = 60.0 / requests_per_minute  # ≈ 3.5 секунды
+        self.interval = 60.0 / requests_per_minute
         self.last_request_time = 0
 
     def wait_if_needed(self):
         now = time.time()
         elapsed = now - self.last_request_time
         if elapsed < self.interval:
-            sleep_time = self.interval - elapsed
-            time.sleep(sleep_time)
+            time.sleep(self.interval - elapsed)
         self.last_request_time = time.time()
 
 rate_limiter = RateLimiter(requests_per_minute=17)
 
-# ---------- ФУНКЦИИ РАБОТЫ С БАЗОЙ ДАННЫХ ----------
+# ---------- ФУНКЦИИ БАЗЫ ДАННЫХ ----------
 def is_processed(game, title):
-    """Проверяет, обрабатывалась ли уже новость (сначала Supabase, потом файл)."""
     if supabase:
         try:
-            response = supabase.table("processed_news").select("*").eq("game", game).eq("title", title).execute()
-            return len(response.data) > 0
-        except Exception as e:
-            print(f"Ошибка проверки в Supabase: {e}")
-            # При ошибке Supabase падаем на файловый кеш
+            resp = supabase.table("processed_news").select("*").eq("game", game).eq("title", title).execute()
+            return len(resp.data) > 0
+        except:
             pass
-    
-    # Файловый кеш (для обратной совместимости)
+    # fallback на файл
     CACHE_FILE = "/tmp/processed_news.txt"
     if not os.path.exists(CACHE_FILE):
         return False
-    try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            content = f.read()
-        return f"{game}|{title}" in content
-    except:
-        return False
+    with open(CACHE_FILE, "r", encoding="utf-8") as f:
+        return f"{game}|{title}" in f.read()
 
 def mark_processed(game, title):
-    """Записывает новость как обработанную (сначала Supabase, потом файл)."""
     if supabase:
         try:
             supabase.table("processed_news").insert({"game": game, "title": title}).execute()
             return
-        except Exception as e:
-            print(f"Ошибка записи в Supabase: {e}")
-            # При ошибке Supabase падаем на файловый кеш
+        except:
             pass
-    
-    # Файловый кеш (для обратной совместимости)
     CACHE_FILE = "/tmp/processed_news.txt"
-    try:
-        with open(CACHE_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{game}|{title}\n")
-    except Exception as e:
-        print(f"Ошибка записи в файловый кеш: {e}")
+    with open(CACHE_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{game}|{title}\n")
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def log(msg):
     print(msg, flush=True)
     sys.stdout.flush()
 
-# ---------- ПАРСИНГ СТАТЕЙ (с извлечением изображений) ----------
+# ---------- ПАРСИНГ СТАТЕЙ ----------
 def fetch_full_article(url, game=None):
     try:
         log(f"Загрузка статьи: {url}")
@@ -170,34 +134,24 @@ def fetch_full_article(url, game=None):
         if "facepunch.com" in url:
             content = soup.find("div", class_="blog")
         elif "warthunder.com" in url:
-            content = soup.find("div", class_="news-text")
-            if not content:
-                content = soup.find("div", class_="content")
+            content = soup.find("div", class_="news-text") or soup.find("div", class_="content")
         elif "steampowered.com" in url:
-            content = soup.find("div", class_="announcement_body")
+            content = soup.find("div", class_="announcement_body") or soup.find("div", class_="news_post_content")
             if not content:
-                content = soup.find("div", class_="news_post_content")
-            if not content:
-                divs = soup.find_all("div")
-                for div in divs:
+                for div in soup.find_all("div"):
                     if len(div.get_text(strip=True)) > 2000:
                         content = div
                         break
         else:
             content = soup.find("article") or soup.find("main") or soup.find("div", class_="content")
 
-        if content:
-            text = content.get_text(separator="\n", strip=True)
-        else:
-            text = soup.get_text(separator="\n", strip=True)
-
+        text = content.get_text(separator="\n", strip=True) if content else soup.get_text(separator="\n", strip=True)
         text = re.sub(r'\s+', ' ', text).strip()
         log(f"Загружено символов: {len(text)}")
 
         image_urls = []
         if game == "warthunder":
-            img_tags = soup.find_all("img")
-            for img in img_tags:
+            for img in soup.find_all("img"):
                 src = img.get("src")
                 if src:
                     if src.startswith("//"):
@@ -212,36 +166,34 @@ def fetch_full_article(url, game=None):
         log(f"Ошибка загрузки статьи: {e}")
         return "", []
 
-# ---------- ПАРСИНГ WAR THUNDER ЧЕРЕЗ HTML (если RSS пуст) ----------
+# ---------- HTML-ПАРСИНГ WAR THUNDER ----------
 def fetch_warthunder_news_from_html():
     try:
         url = "https://warthunder.com/en/news/"
         log(f"Парсинг HTML новостей War Thunder: {url}")
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
-            log(f"Ошибка загрузки страницы новостей: {r.status_code}")
             return None
         soup = BeautifulSoup(r.text, "html.parser")
-        news_items = soup.find_all("div", class_=re.compile(r"news-item|news-block|news-card"))
-        if not news_items:
-            news_links = soup.find_all("a", href=re.compile(r"/en/news/"))
-            if news_links:
-                for link in news_links:
-                    if link.get_text(strip=True):
-                        title = link.get_text(strip=True)
-                        href = link.get("href")
-                        if href and href.startswith("/"):
-                            href = "https://warthunder.com" + href
-                        return {"title": title, "link": href}
-        if news_items:
-            first = news_items[0]
-            title_tag = first.find("h2") or first.find("h3") or first.find("a")
-            title = title_tag.get_text(strip=True) if title_tag else "Новость War Thunder"
-            link_tag = first.find("a")
-            link = link_tag.get("href") if link_tag else None
-            if link and link.startswith("/"):
-                link = "https://warthunder.com" + link
-            return {"title": title, "link": link}
+        for item in soup.find_all("div", class_=re.compile(r"news-item|news-block|news-card")):
+            title_tag = item.find("h2") or item.find("h3") or item.find("a")
+            if not title_tag:
+                continue
+            title = title_tag.get_text(strip=True)
+            link_tag = item.find("a")
+            if link_tag:
+                href = link_tag.get("href")
+                if href and href.startswith("/"):
+                    href = "https://warthunder.com" + href
+                return {"title": title, "link": href}
+        # если не нашли, ищем ссылки
+        for a in soup.find_all("a", href=re.compile(r"/en/news/")):
+            if a.get_text(strip=True):
+                title = a.get_text(strip=True)
+                href = a.get("href")
+                if href and href.startswith("/"):
+                    href = "https://warthunder.com" + href
+                return {"title": title, "link": href}
         log("Не удалось найти новости на HTML-странице War Thunder")
         return None
     except Exception as e:
@@ -249,38 +201,19 @@ def fetch_warthunder_news_from_html():
         return None
 
 # ---------- СИСТЕМНЫЙ ПРОМПТ ----------
-SYSTEM_PROMPT = """Ты — анализатор патч-ноутов компьютерных игр. Извлеки ВСЕ изменения из текста и представь их в виде JSON на РУССКОМ языке.
-
-КРИТИЧЕСКИ ВАЖНО: ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ВСЕ ЗАГОЛОВКИ РАЗДЕЛОВ, ПУНКТЫ И ИДЕНТИФИКАТОРЫ ДОЛЖНЫ БЫТЬ НА РУССКОМ.
-
-В тексте могут быть технические термины (команды, консольные переменные, префабы, хуки, методы, классы). Ты ОБЯЗАН найти их все и указать в круглых скобках после каждого пункта, если они есть.
-
-Форматы идентификаторов (на русском):
-- (команда: имя)
-- (консольная переменная: имя)
-- (префаб: путь)
-- (хук: имя)
-- (метод: Класс.Метод)
-- (класс: имя)
-
-НЕ ВЫДУМЫВАЙ идентификаторы! Если точного названия нет в тексте — не пиши его.
-
+SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извлеки ВСЕ изменения из текста и представь их в виде JSON на РУССКОМ языке.
+КРИТИЧЕСКИ ВАЖНО: ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ.
+В тексте могут быть технические термины (команды, консольные переменные, префабы, хуки, методы, классы) – вытащи их и укажи в скобках.
+НЕ ВЫДУМЫВАЙ идентификаторы! Если точного названия нет – не пиши.
 Формат JSON:
-{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Название раздела на русском","items":["пункт 1 на русском (идентификаторы)","пункт 2"]}],"nothing_new":false}
-
-Если изменений нет:
-{"nothing_new": true, "reason": "причина на русском"}
-
+{"main_emoji":"эмодзи","sections":[{"emoji":"эмодзи","title":"Название раздела","items":["пункт 1 (идентификаторы)","пункт 2"]}],"nothing_new":false}
+Если изменений нет: {"nothing_new": true, "reason": "причина на русском"}
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
 # ---------- ОТПРАВКА ЗАПРОСА ----------
 def send_request(payload, model):
     rate_limiter.wait_if_needed()
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     payload["model"] = model
 
     for attempt in range(3):
@@ -288,25 +221,24 @@ def send_request(payload, model):
             r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
             if r.status_code == 429:
                 wait = 2 ** (attempt + 1)
-                log(f"Превышен лимит для модели {model}, ждём {wait}с...")
+                log(f"Превышен лимит для {model}, ждём {wait}с...")
                 time.sleep(wait)
                 continue
             if r.status_code != 200:
                 log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
-                if attempt < 2 and len(FALLBACK_MODELS) > attempt:
-                    fallback_model = FALLBACK_MODELS[attempt]
-                    log(f"Переключаемся на запасную модель: {fallback_model}")
-                    payload["model"] = fallback_model
+                if attempt < len(FALLBACK_MODELS):
+                    fallback = FALLBACK_MODELS[attempt]
+                    log(f"Переключаемся на {fallback}")
+                    payload["model"] = fallback
                     continue
                 return None
             response_text = r.json()["choices"][0]["message"]["content"]
-            log(f"Получен ответ модели {model} (символов: {len(response_text)})")
+            log(f"Получен ответ модели (символов: {len(response_text)})")
             match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if not match:
-                log("Не найден JSON в ответе модели")
+                log("Не найден JSON")
                 return None
-            json_str = match.group(0)
-            json_str = re.sub(r'^```(?:json)?\s*\n?', '', json_str, flags=re.MULTILINE)
+            json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
             json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
             return json.loads(json_str)
         except Exception as e:
@@ -314,24 +246,13 @@ def send_request(payload, model):
             time.sleep(2 ** attempt)
     return None
 
-def has_identifiers(analysis):
-    for section in analysis.get("sections", []):
-        for item in section.get("items", []):
-            if re.search(r'\([^)]+\)', item):
-                return True
-    return False
-
 def analyze_with_qwen(full_text, model):
     if not OPENROUTER_API_KEY:
         log("Нет API-ключа")
         return None
-
-    user_prompt = f"""Проанализируй этот патч-ноут. В тексте есть технические термины (команды, консольные переменные, префабы, хуки, методы, классы).
-ВЫТАЩИ ИХ ВСЕ и укажи в скобках после каждого пункта. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ.
-
+    user_prompt = f"""Проанализируй патч-ноут. Вытащи ВСЕ технические термины (команды, консольные переменные, префабы, хуки, методы, классы) и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
 Патч-ноут:
 {full_text}"""
-
     payload = {
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -340,18 +261,17 @@ def analyze_with_qwen(full_text, model):
         "max_tokens": 8000,
         "temperature": 0.1
     }
-
     result = send_request(payload, model)
     if result:
-        if has_identifiers(result):
-            log(f"Идентификаторы найдены в модели {model}.")
+        has_id = any(re.search(r'\([^)]+\)', item) for sec in result.get("sections", []) for item in sec.get("items", []))
+        if has_id:
+            log("Идентификаторы найдены.")
             return result
         else:
-            log(f"Идентификаторы не найдены в модели {model}, повторный запрос с требованием")
-            user_prompt2 = f"""Ты не вытащил технические термины! Найди их и укажи в скобках. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ.
+            log("Идентификаторы не найдены, повторный запрос с требованием")
+            payload["messages"][1]["content"] = f"""Ты не вытащил технические термины! Найди их и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
 Патч-ноут:
 {full_text}"""
-            payload["messages"][1]["content"] = user_prompt2
             result2 = send_request(payload, model)
             return result2 if result2 else result
     return None
@@ -366,25 +286,19 @@ def format_message(game, title, link, raw_text, model):
     if not full_text or len(full_text) < 50:
         log("Не удалось загрузить полную статью, используем краткий анонс")
         full_text = raw_text
-
     if not full_text or len(full_text) < 20:
         log("Нет текста для анализа")
         return None, []
 
     analysis = analyze_with_qwen(full_text, model)
     if analysis is None:
-        log("Анализ не удался")
         return None, []
-
     if analysis.get("nothing_new"):
         log(f"Нет новых изменений: {analysis.get('reason', '')}")
         return [], []
 
     main_emoji = analysis.get("main_emoji", "📦")
-    title_line = f"{main_emoji} Обновление: **{title}**"
-    if version:
-        title_line += f" — `{version}`"
-
+    title_line = f"{main_emoji} Обновление: **{title}**" + (f" — `{version}`" if version else "")
     messages = []
     current = f"## {title_line}\n"
     part = 1
@@ -397,9 +311,7 @@ def format_message(game, title, link, raw_text, model):
         if not items:
             continue
         block = f"\n### {emoji} {section_title}:\n"
-        item_lines = []
-        for item in items[:10]:
-            item_lines.append(f"🔹 {item}")
+        item_lines = [f"🔹 {item}" for item in items[:10]]
         if len(current + block + "\n".join(item_lines)) > max_len:
             current += f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name} (часть {part})"
             messages.append(current)
@@ -407,16 +319,13 @@ def format_message(game, title, link, raw_text, model):
             current = f"## {title_line} (часть {part})\n"
         current += block + "\n".join(item_lines) + "\n"
 
-    footer = f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name}"
-    if part > 1:
-        footer += f" (часть {part})"
+    footer = f"\n📎 [Патч-ноут]({link}) | 🎮 {game_name}" + (f" (часть {part})" if part > 1 else "")
     if len(current + footer) > max_len:
         messages.append(current)
         current = footer
     else:
         current += footer
     messages.append(current)
-
     return messages, image_urls
 
 def send_to_discord(game, title, link, raw_text):
@@ -424,7 +333,6 @@ def send_to_discord(game, title, link, raw_text):
     if not webhook:
         log(f"Вебхук для {game} не настроен")
         return
-
     if is_processed(game, title):
         log(f"Новость уже обработана: {title}")
         return
@@ -481,7 +389,7 @@ def send_to_discord(game, title, link, raw_text):
                     log(f"Ошибка отправки группы изображений: {e}")
                 time.sleep(1)
 
-# ---------- RSS И HTML-ПАРСИНГ ----------
+# ---------- RSS ----------
 def is_old(published_parsed):
     if not published_parsed:
         return False
@@ -496,22 +404,18 @@ def process_game(game, url):
         feed = feedparser.parse(url)
         entries = feed.entries
         if not entries:
-            log(f"RSS для {game} пуст")
             if game == "warthunder":
-                log("Пробуем получить новости War Thunder через HTML...")
+                log("RSS War Thunder пуст, пробуем HTML...")
                 news = fetch_warthunder_news_from_html()
                 if news:
-                    title = news.get("title")
-                    link = news.get("link")
-                    raw = ""
+                    title, link = news.get("title"), news.get("link")
                     log(f"Обработка {game} (из HTML): {title}")
-                    send_to_discord(game, title, link, raw)
+                    send_to_discord(game, title, link, "")
                 else:
-                    log(f"Не удалось получить новости для {game} ни через RSS, ни через HTML")
+                    log(f"Не удалось получить новости для {game}")
             else:
                 log(f"Нет записей в {game}")
             return
-
         entry = entries[0]
         if is_old(entry.get("published_parsed")):
             log(f"Новость старая: {entry.get('title')}")
@@ -526,9 +430,13 @@ def process_game(game, url):
 
 def check_feeds():
     log("Проверка RSS...")
-    for game, url in RSS_FEEDS.items():
-        process_game(game, url)
-        time.sleep(3.5)
+    # Задаём порядок обработки: сначала War Thunder, потом остальные, и наконец Rust.
+    order = ["warthunder", "garrysmod", "unturned", "sbox", "rust"]
+    for game in order:
+        url = RSS_FEEDS.get(game)
+        if url:
+            process_game(game, url)
+            time.sleep(3.5)  # пауза между играми
 
 # ---------- FLASK ----------
 @app.route("/")
