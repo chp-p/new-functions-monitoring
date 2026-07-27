@@ -197,7 +197,7 @@ def fetch_full_article(url, game=None):
         log(f"Ошибка загрузки статьи: {e}")
         return "", []
 
-# ---------- ПАРСИНГ HTML ДЛЯ sbox (если RSS пуст) ----------
+# ---------- ПАРСИНГ HTML ДЛЯ sbox ----------
 def fetch_sbox_news_from_html():
     try:
         url = "https://sbox.facepunch.com/news/"
@@ -206,18 +206,24 @@ def fetch_sbox_news_from_html():
         if r.status_code != 200:
             return None
         soup = BeautifulSoup(r.text, "html.parser")
-        post = soup.find("div", class_="blog-post") or soup.find("article")
-        if not post:
-            for div in soup.find_all("div"):
-                if len(div.get_text(strip=True)) > 500:
-                    post = div
-                    break
-        if post:
-            title_tag = post.find("h1") or post.find("h2") or post.find("h3")
-            title = title_tag.get_text(strip=True) if title_tag else "Новость sbox"
-            link_tag = post.find("a", href=True)
-            if link_tag:
-                href = link_tag["href"]
+        candidates = []
+        for tag in soup.find_all(["div", "article", "section"]):
+            text = tag.get_text(strip=True)
+            if len(text) > 200:
+                link_tag = tag.find("a", href=True)
+                if link_tag:
+                    href = link_tag["href"]
+                    if href.startswith("/"):
+                        href = "https://sbox.facepunch.com" + href
+                    title_tag = tag.find("h1") or tag.find("h2") or tag.find("h3") or link_tag
+                    title = title_tag.get_text(strip=True) if title_tag else "Новость sbox"
+                    candidates.append({"title": title, "link": href})
+        if candidates:
+            return candidates[0]
+        for a in soup.find_all("a", href=re.compile(r"/news/")):
+            if a.get_text(strip=True):
+                title = a.get_text(strip=True)
+                href = a["href"]
                 if href.startswith("/"):
                     href = "https://sbox.facepunch.com" + href
                 return {"title": title, "link": href}
@@ -227,7 +233,7 @@ def fetch_sbox_news_from_html():
         log(f"Ошибка парсинга HTML sbox: {e}")
         return None
 
-# ---------- HTML-ПАРСИНГ WAR THUNDER (если RSS пуст) ----------
+# ---------- HTML-ПАРСИНГ WAR THUNDER ----------
 def fetch_warthunder_news_from_html():
     try:
         url = "https://warthunder.com/en/news/"
@@ -270,7 +276,7 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 Если изменений нет: {"nothing_new": true, "reason": "причина на русском"}
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА (OpenRouter → GitHub → Groq) ----------
+# ---------- ОТПРАВКА ЗАПРОСА ----------
 def send_request(payload, model):
     rate_limiter.wait_if_needed()
 
@@ -288,12 +294,13 @@ def send_request(payload, model):
                 log("OpenRouter всё ещё недоступна, переключаемся на GitHub")
                 return send_to_github(payload)
         if r.status_code != 200:
-            log(f"OpenRouter ошибка: {r.status_code} {r.text[:300]}")
+            log(f"OpenRouter ошибка: {r.status_code}")
             return send_to_github(payload)
         response_text = r.json()["choices"][0]["message"]["content"]
         log("Успешный ответ от OpenRouter")
         match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if not match:
+            log("Не найден JSON, переключаемся на GitHub")
             return send_to_github(payload)
         json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
         json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
@@ -332,7 +339,7 @@ def send_to_github(payload):
                 log("GitHub Models недоступна, переключаемся на Groq")
                 return send_to_groq(payload)
         if r.status_code != 200:
-            log(f"GitHub Models ошибка: {r.status_code} {r.text[:300]}")
+            log(f"GitHub Models ошибка: {r.status_code}")
             return send_to_groq(payload)
         response_text = r.json()["choices"][0]["message"]["content"]
         log("Успешный ответ от GitHub Models")
@@ -372,7 +379,7 @@ def send_to_groq(payload):
                 log("Groq недоступна")
                 return None
         if r.status_code != 200:
-            log(f"Groq ошибка: {r.status_code} {r.text[:300]}")
+            log(f"Groq ошибка: {r.status_code}")
             return None
         response_text = r.json()["choices"][0]["message"]["content"]
         log("Успешный ответ от Groq")
@@ -417,6 +424,9 @@ def analyze_with_qwen(full_text, model):
 {full_text}"""
             result2 = send_request(payload, model)
             return result2 if result2 else result
+    else:
+        log("Анализ не удался, возвращаем nothing_new")
+        return {"nothing_new": True, "reason": "Анализ не удался"}
     return None
 
 # ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD ----------
@@ -431,14 +441,16 @@ def format_message(game, title, link, raw_text, model):
         full_text = raw_text
     if not full_text or len(full_text) < 20:
         log("Нет текста для анализа")
-        return None, []
+        return [f"## ⚠️ Обновление: **{title}**\n\nНе удалось загрузить текст статьи.\n📎 [Ссылка]({link})"], []
 
     analysis = analyze_with_qwen(full_text, model)
     if analysis is None:
-        return None, []
+        return [f"## ⚠️ Обновление: **{title}**\n\nНе удалось обработать статью.\n📎 [Ссылка]({link})"], []
+
     if analysis.get("nothing_new"):
-        log(f"Нет новых изменений: {analysis.get('reason', '')}")
-        return [], []
+        reason = analysis.get("reason", "Изменений не найдено")
+        log(f"Нет новых изменений: {reason}")
+        return [f"## ℹ️ Обновление: **{title}**\n\n{reason}\n📎 [Ссылка]({link})"], []
 
     main_emoji = analysis.get("main_emoji", "📦")
     title_line = f"{main_emoji} Обновление: **{title}**" + (f" — `{version}`" if version else "")
@@ -487,6 +499,7 @@ def send_to_discord(game, title, link, raw_text):
     text_messages, image_urls = format_message(game, title, link, raw_text, model)
     if not text_messages:
         log(f"Нет сообщений для отправки ({title})")
+        mark_processed(game, title)
         return
 
     mark_processed(game, title)
@@ -500,7 +513,7 @@ def send_to_discord(game, title, link, raw_text):
             if r.status_code == 204:
                 log(f"Отправлено текстовое сообщение для {game}: {title}")
             else:
-                log(f"Ошибка Discord: {r.status_code} {r.text[:200]}")
+                log(f"Ошибка Discord: {r.status_code}")
         except Exception as e:
             log(f"Ошибка отправки в Discord: {e}")
         time.sleep(2)
@@ -518,9 +531,9 @@ def send_to_discord(game, title, link, raw_text):
             try:
                 r = requests.post(webhook, json=payload)
                 if r.status_code == 204:
-                    log(f"Отправлено изображение {idx+1} (embed): {url}")
+                    log(f"Отправлено изображение {idx+1} (embed)")
                 else:
-                    log(f"Не удалось отправить embed, отправляем ссылкой: {url}")
+                    log(f"Не удалось отправить embed, отправляем ссылкой")
                     link_payload = {"content": f"📷 <{url}>", "allowed_mentions": {"parse": []}}
                     requests.post(webhook, json=link_payload)
             except Exception as e:
@@ -544,7 +557,7 @@ def send_to_discord(game, title, link, raw_text):
             except Exception as e:
                 log(f"Ошибка отправки дополнительных ссылок: {e}")
 
-# ---------- RSS (с поддержкой 2 последних статей и игнорированием возраста для Garry's Mod) ----------
+# ---------- RSS ----------
 def is_old(published_parsed):
     if not published_parsed:
         return False
@@ -582,15 +595,10 @@ def process_game(game, url):
                 log(f"Нет записей в {game}")
             return
 
-        # Берем до 2 последних записей
         max_entries = min(2, len(entries))
         for i in range(max_entries):
             entry = entries[i]
-            # Для Garry's Mod игнорируем возраст
-            if game == "garrysmod":
-                # Пропускаем проверку is_old
-                pass
-            else:
+            if game != "garrysmod":
                 if is_old(entry.get("published_parsed")):
                     log(f"Новость старая (пропускаем): {entry.get('title')}")
                     continue
