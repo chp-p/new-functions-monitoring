@@ -20,7 +20,13 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Groq API
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"   # основная модель Groq
+# Основные модели Groq (будут перебираться при ошибках)
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",      # основная
+    "qwen/qwen3.6-27b",             # альтернатива
+    "openai/gpt-oss-120b",          # ещё одна
+    "deepseek-r1-distill-llama-70b" # запасная
+]
 
 # OpenRouter модели (для всех игр)
 MODELS = {
@@ -31,11 +37,11 @@ MODELS = {
     "warthunder": "nvidia/nemotron-3-ultra-550b-a55b:free"
 }
 
-# Запасные модели при ошибках (сначала OpenRouter fallback, потом Groq)
-FALLBACK_MODELS = [
-    "qwen/qwen-2.5-72b-instruct:free",   # OpenRouter
-    "google/gemma-4-31b-it:free",        # OpenRouter
-    "deepseek/deepseek-v4-flash:free",   # OpenRouter
+# Запасные модели OpenRouter (fallback)
+OR_FALLBACK_MODELS = [
+    "qwen/qwen-2.5-72b-instruct:free",
+    "google/gemma-4-31b-it:free",
+    "deepseek/deepseek-v4-flash:free",
 ]
 
 WEBHOOKS = {
@@ -163,7 +169,9 @@ def fetch_full_article(url, game=None):
                         src = "https:" + src
                     elif src.startswith("/"):
                         src = "https://warthunder.com" + src
-                    image_urls.append(src)
+                    # Проверяем, что это изображение (по расширению или content-type)
+                    if re.search(r'\.(jpg|jpeg|png|gif|webp|bmp|svg)(\?.*)?$', src, re.I):
+                        image_urls.append(src)
             log(f"Найдено изображений: {len(image_urls)}")
 
         return text[:50000], image_urls
@@ -215,7 +223,7 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 Если изменений нет: {"nothing_new": true, "reason": "причина на русском"}
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА (с переключением на Groq) ----------
+# ---------- ОТПРАВКА ЗАПРОСА (с переключением на Groq и fallback моделями) ----------
 def send_request(payload, model):
     rate_limiter.wait_if_needed()
     
@@ -233,15 +241,15 @@ def send_request(payload, model):
                 continue
             if r.status_code != 200:
                 log(f"Ошибка OpenRouter: {r.status_code} {r.text[:300]}")
-                # Если модель недоступна, пробуем следующую из FALLBACK_MODELS (OpenRouter)
-                if attempt < len(FALLBACK_MODELS):
-                    fallback = FALLBACK_MODELS[attempt]
+                # Пробуем OpenRouter fallback модели
+                if attempt < len(OR_FALLBACK_MODELS):
+                    fallback = OR_FALLBACK_MODELS[attempt]
                     log(f"Переключаемся на OpenRouter запасную: {fallback}")
                     payload["model"] = fallback
                     continue
                 # Если все OpenRouter модели исчерпаны, пробуем Groq
-                if GROQ_API_KEY and attempt >= len(FALLBACK_MODELS):
-                    log("Все модели OpenRouter исчерпаны, переключаемся на Groq")
+                if GROQ_API_KEY:
+                    log("Все OpenRouter модели исчерпаны, переключаемся на Groq")
                     return send_to_groq(payload)
                 return None
             response_text = r.json()["choices"][0]["message"]["content"]
@@ -256,55 +264,65 @@ def send_request(payload, model):
         except Exception as e:
             log(f"Попытка OpenRouter {attempt+1} ошибка: {e}")
             time.sleep(2 ** attempt)
+    
+    # Если OpenRouter не удался, пробуем Groq
+    if GROQ_API_KEY:
+        log("OpenRouter не ответил, пробуем Groq...")
+        return send_to_groq(payload)
     return None
 
 def send_to_groq(payload):
-    """Отправляет запрос в Groq (использует системный промпт из payload)."""
+    """Отправляет запрос в Groq с перебором моделей."""
     if not GROQ_API_KEY:
         log("GROQ_API_KEY не задан, невозможно использовать Groq")
         return None
-    
+
     # Формируем сообщения для Groq (они совместимы с OpenAI)
     messages = payload.get("messages", [])
     # Добавляем системный промпт (если его нет)
     if not any(msg.get("role") == "system" for msg in messages):
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
     
-    groq_payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "max_tokens": payload.get("max_tokens", 8000),
-        "temperature": payload.get("temperature", 0.1)
-    }
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
     
-    for attempt in range(3):
-        try:
-            log(f"Отправка запроса в Groq (модель: {GROQ_MODEL})")
-            r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
-            if r.status_code == 429:
-                wait = 2 ** (attempt + 1)
-                log(f"Превышен лимит Groq, ждём {wait}с...")
-                time.sleep(wait)
-                continue
-            if r.status_code != 200:
-                log(f"Ошибка Groq: {r.status_code} {r.text[:300]}")
-                return None
-            response_text = r.json()["choices"][0]["message"]["content"]
-            log(f"Получен ответ от Groq (символов: {len(response_text)})")
-            match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if not match:
-                log("Не найден JSON в ответе Groq")
-                return None
-            json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
-            json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
-            return json.loads(json_str)
-        except Exception as e:
-            log(f"Попытка Groq {attempt+1} ошибка: {e}")
-            time.sleep(2 ** attempt)
+    # Перебираем модели Groq
+    for model in GROQ_MODELS:
+        log(f"Пробуем Groq модель: {model}")
+        groq_payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": payload.get("max_tokens", 8000),
+            "temperature": payload.get("temperature", 0.1)
+        }
+        
+        for attempt in range(2):  # по 2 попытки на модель
+            try:
+                r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
+                if r.status_code == 429:
+                    wait = 2 ** (attempt + 1)
+                    log(f"Превышен лимит Groq для {model}, ждём {wait}с...")
+                    time.sleep(wait)
+                    continue
+                if r.status_code != 200:
+                    log(f"Ошибка Groq для {model}: {r.status_code} {r.text[:300]}")
+                    break  # переходим к следующей модели
+                response_text = r.json()["choices"][0]["message"]["content"]
+                log(f"Получен ответ от Groq (модель {model}, символов: {len(response_text)})")
+                match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if not match:
+                    log("Не найден JSON в ответе Groq")
+                    continue
+                json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
+                json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
+                return json.loads(json_str)
+            except Exception as e:
+                log(f"Ошибка с Groq моделью {model}: {e}")
+                time.sleep(2 ** attempt)
+        # Если модель не сработала, переходим к следующей
+    log("Все модели Groq исчерпаны")
     return None
 
 def analyze_with_qwen(full_text, model):
@@ -330,37 +348,22 @@ def analyze_with_qwen(full_text, model):
         # Проверяем наличие идентификаторов
         has_id = any(re.search(r'\([^)]+\)', item) for sec in result.get("sections", []) for item in sec.get("items", []))
         if has_id:
-            log("Идентификаторы найдены (OpenRouter).")
+            log("Идентификаторы найдены.")
             return result
         else:
-            log("Идентификаторы не найдены, повторный запрос с требованием (OpenRouter)")
+            log("Идентификаторы не найдены, повторный запрос с требованием")
             payload["messages"][1]["content"] = f"""Ты не вытащил технические термины! Найди их и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
 Патч-ноут:
 {full_text}"""
-            result2 = send_request(payload, model)
-            return result2 if result2 else result
-    else:
-        # Если OpenRouter не удалось, пробуем Groq напрямую
-        if GROQ_API_KEY:
-            log("OpenRouter не ответил, пробуем Groq...")
-            result_groq = send_to_groq(payload)
-            if result_groq:
-                has_id_groq = any(re.search(r'\([^)]+\)', item) for sec in result_groq.get("sections", []) for item in sec.get("items", []))
-                if has_id_groq:
-                    log("Идентификаторы найдены (Groq).")
-                    return result_groq
-                else:
-                    log("Идентификаторы не найдены в Groq, повторный запрос с требованием")
-                    payload["messages"][1]["content"] = f"""Ты не вытащил технические термины! Найди их и укажи в скобках. ОТВЕЧАЙ НА РУССКОМ.
-Патч-ноут:
-{full_text}"""
-                    result_groq2 = send_to_groq(payload)
-                    return result_groq2 if result_groq2 else result_groq
+            # Повторяем запрос с тем же источником (OpenRouter или Groq)
+            if result.get("source") == "groq":
+                result2 = send_to_groq(payload)
             else:
-                log("Groq также не ответил.")
-        return None
+                result2 = send_request(payload, model)
+            return result2 if result2 else result
+    return None
 
-# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD ----------
+# ---------- ФОРМАТИРОВАНИЕ И ОТПРАВКА В DISCORD (с исправленными изображениями) ----------
 def format_message(game, title, link, raw_text, model):
     game_name = GAME_NAMES.get(game, game)
     version_match = re.search(r'(\d+\.\d+\.\d+\.\d+|\d+\.\d+\.\d+|\d+\.\d+)', title)
@@ -429,6 +432,7 @@ def send_to_discord(game, title, link, raw_text):
 
     mark_processed(game, title)
 
+    # Отправка текстовых сообщений
     for msg in text_messages:
         if len(msg) > 2000:
             log(f"Предупреждение: длина сообщения {len(msg)} > 2000")
@@ -438,40 +442,50 @@ def send_to_discord(game, title, link, raw_text):
             if r.status_code == 204:
                 log(f"Отправлено текстовое сообщение для {game}: {title}")
             else:
-                log(f"Ошибка Discord {r.status_code}: {r.text[:200]}")
+                log(f"Ошибка Discord при отправке текста: {r.status_code} {r.text[:200]}")
         except Exception as e:
-            log(f"Ошибка отправки в Discord: {e}")
+            log(f"Ошибка отправки текста в Discord: {e}")
         time.sleep(2)
 
+    # Отправка изображений (War Thunder) через embed
     if image_urls and game == "warthunder":
         log(f"Отправка {len(image_urls)} изображений для {game}")
-        chunk_size = 5
-        for i in range(0, len(image_urls), chunk_size):
-            chunk = image_urls[i:i+chunk_size]
-            img_text = "📷 **Изображения из новости:**\n" + "\n".join(chunk)
-            if len(img_text) > 2000:
-                for url in chunk:
-                    payload = {"content": f"📷 {url}", "allowed_mentions": {"parse": []}}
-                    try:
-                        r = requests.post(webhook, json=payload)
-                        if r.status_code == 204:
-                            log(f"Отправлено изображение: {url}")
-                        else:
-                            log(f"Ошибка отправки изображения: {r.status_code}")
-                    except Exception as e:
-                        log(f"Ошибка отправки изображения: {e}")
-                    time.sleep(1)
-            else:
-                payload = {"content": img_text, "allowed_mentions": {"parse": []}}
-                try:
-                    r = requests.post(webhook, json=payload)
-                    if r.status_code == 204:
-                        log(f"Отправлена группа изображений ({len(chunk)} шт)")
-                    else:
-                        log(f"Ошибка отправки группы изображений: {r.status_code}")
-                except Exception as e:
-                    log(f"Ошибка отправки группы изображений: {e}")
-                time.sleep(1)
+        # Отправляем по одному изображению в embed
+        for idx, url in enumerate(image_urls[:10]):  # ограничим 10, чтобы не флудить
+            embed = {
+                "title": "📷 Изображение из новости",
+                "image": {"url": url},
+                "color": 0x00ff00,
+                "footer": {"text": f"Изображение {idx+1} из {len(image_urls)}"}
+            }
+            payload = {
+                "content": "",
+                "embeds": [embed],
+                "allowed_mentions": {"parse": []}
+            }
+            try:
+                r = requests.post(webhook, json=payload)
+                if r.status_code == 204:
+                    log(f"Отправлено изображение {idx+1}: {url}")
+                else:
+                    log(f"Ошибка отправки изображения {idx+1}: {r.status_code} {r.text[:200]}")
+            except Exception as e:
+                log(f"Ошибка отправки изображения {idx+1}: {e}")
+            time.sleep(1)
+
+        # Если изображений больше 10, отправляем ссылки текстом
+        if len(image_urls) > 10:
+            extra_urls = image_urls[10:]
+            links_text = "📷 **Дополнительные изображения:**\n" + "\n".join(extra_urls[:10])
+            payload = {"content": links_text, "allowed_mentions": {"parse": []}}
+            try:
+                r = requests.post(webhook, json=payload)
+                if r.status_code == 204:
+                    log("Отправлены дополнительные ссылки на изображения")
+                else:
+                    log(f"Ошибка отправки дополнительных ссылок: {r.status_code}")
+            except Exception as e:
+                log(f"Ошибка отправки дополнительных ссылок: {e}")
 
 # ---------- RSS ----------
 def is_old(published_parsed):
