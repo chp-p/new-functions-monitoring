@@ -20,7 +20,8 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Groq API
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-# Список моделей Groq (будут перебираться по очереди)
+
+# Список моделей Groq (перебираются по порядку, только если OpenRouter не сработал)
 GROQ_MODELS = [
     "groq/compound",
     "llama-3.3-70b-versatile",
@@ -38,7 +39,7 @@ MODELS = {
     "warthunder": "nvidia/nemotron-3-ultra-550b-a55b:free"
 }
 
-# Список моделей OpenRouter для перебора (все бесплатные)
+# Список моделей OpenRouter (перебираются по порядку, только если предыдущая не сработала)
 OR_MODELS = [
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "google/gemma-4-31b-it:free",
@@ -73,7 +74,7 @@ GAME_NAMES = {
     "warthunder": "War Thunder"
 }
 
-# ---------- SUPABASE (усиленная обработка ошибок) ----------
+# ---------- SUPABASE ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 supabase: Client = None
@@ -82,7 +83,6 @@ SUPABASE_ENABLED = False
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        # Проверяем доступность таблицы
         test = supabase.table("processed_news").select("*").limit(1).execute()
         SUPABASE_ENABLED = True
         print("✅ Supabase подключен, таблица существует.")
@@ -108,9 +108,8 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(requests_per_minute=17)
 
-# ---------- ФУНКЦИИ БАЗЫ ДАННЫХ (с подробным логированием) ----------
+# ---------- ФУНКЦИИ БАЗЫ ДАННЫХ ----------
 def is_processed(game, title):
-    """Проверяет, есть ли уже запись об этой новости."""
     if SUPABASE_ENABLED and supabase:
         try:
             resp = supabase.table("processed_news").select("*").eq("game", game).eq("title", title).execute()
@@ -118,9 +117,7 @@ def is_processed(game, title):
                 log(f"Найдено в Supabase: {game}|{title}")
                 return True
         except Exception as e:
-            log(f"Ошибка запроса к Supabase (is_processed): {e}")
-            # Если Supabase недоступен, используем файловый кеш
-    # fallback на файл
+            log(f"Ошибка запроса к Supabase: {e}")
     CACHE_FILE = "/tmp/processed_news.txt"
     if not os.path.exists(CACHE_FILE):
         return False
@@ -135,17 +132,13 @@ def is_processed(game, title):
         return False
 
 def mark_processed(game, title):
-    """Записывает новость как обработанную."""
     if SUPABASE_ENABLED and supabase:
         try:
-            # Используем upsert, чтобы избежать дублирования
             supabase.table("processed_news").upsert({"game": game, "title": title}, on_conflict="game,title").execute()
             log(f"Записано в Supabase: {game}|{title}")
             return
         except Exception as e:
-            log(f"Ошибка записи в Supabase (mark_processed): {e}")
-            # Продолжаем запись в файл
-    # fallback на файл
+            log(f"Ошибка записи в Supabase: {e}")
     CACHE_FILE = "/tmp/processed_news.txt"
     try:
         with open(CACHE_FILE, "a", encoding="utf-8") as f:
@@ -250,52 +243,57 @@ SYSTEM_PROMPT = """Ты — анализатор патч-ноутов. Извл
 Если изменений нет: {"nothing_new": true, "reason": "причина на русском"}
 ОТВЕТ ТОЛЬКО JSON, БЕЗ ЛИШНЕГО ТЕКСТА, ВСЁ НА РУССКОМ."""
 
-# ---------- ОТПРАВКА ЗАПРОСА (каждая статья сначала перебирает все OpenRouter модели) ----------
+# ---------- ОТПРАВКА ЗАПРОСА (сначала пробуем первую рабочую модель, переключаемся только при ошибках) ----------
 def send_request(payload):
-    """Пытается отправить запрос через OpenRouter, перебирая все модели из OR_MODELS."""
+    """Пытается отправить запрос: сначала OpenRouter с первой моделью, если ошибка – перебирает остальные.
+    Если все OpenRouter не сработали – переходит к Groq."""
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
 
-    # Сначала пробуем все модели OpenRouter
+    # 1. Пробуем OpenRouter модели по порядку, но останавливаемся на первой успешной
     for or_model in OR_MODELS:
         log(f"Пробуем OpenRouter модель: {or_model}")
         payload_copy = payload.copy()
         payload_copy["model"] = or_model
 
-        for attempt in range(2):  # по 2 попытки на модель
-            try:
+        # Делаем только одну попытку без повторных (кроме 429)
+        try:
+            r = requests.post(OPENROUTER_URL, headers=headers, json=payload_copy, timeout=120)
+            if r.status_code == 429:
+                wait = 5
+                log(f"OpenRouter {or_model} лимит, ждём {wait}с...")
+                time.sleep(wait)
+                # После ожидания пробуем ещё раз ту же модель
                 r = requests.post(OPENROUTER_URL, headers=headers, json=payload_copy, timeout=120)
-                if r.status_code == 429:
-                    wait = 2 ** (attempt + 1)
-                    log(f"OpenRouter {or_model} лимит, ждём {wait}с...")
-                    time.sleep(wait)
-                    continue
                 if r.status_code != 200:
-                    log(f"OpenRouter {or_model} ошибка: {r.status_code} {r.text[:300]}")
-                    break  # переходим к следующей модели
-                response_text = r.json()["choices"][0]["message"]["content"]
-                log(f"Успешный ответ от OpenRouter ({or_model})")
-                match = re.search(r'\{.*\}', response_text, re.DOTALL)
-                if not match:
-                    log("Не найден JSON в ответе OpenRouter")
+                    log(f"OpenRouter {or_model} всё ещё недоступна, переходим к следующей")
                     continue
-                json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
-                json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
-                return json.loads(json_str)
-            except Exception as e:
-                log(f"OpenRouter {or_model} попытка {attempt+1} ошибка: {e}")
-                time.sleep(2 ** attempt)
-        # Если не сработало, переходим к следующей модели
+            if r.status_code != 200:
+                log(f"OpenRouter {or_model} ошибка: {r.status_code} {r.text[:300]}")
+                continue  # переходим к следующей модели
 
-    # Если все OpenRouter модели не сработали, пробуем Groq
+            response_text = r.json()["choices"][0]["message"]["content"]
+            log(f"Успешный ответ от OpenRouter ({or_model})")
+            match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if not match:
+                log("Не найден JSON в ответе OpenRouter, пробуем следующую модель")
+                continue
+            json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
+            json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
+            return json.loads(json_str)
+        except Exception as e:
+            log(f"OpenRouter {or_model} ошибка: {e}")
+            continue
+
+    # 2. Если все OpenRouter не сработали, пробуем Groq
     if GROQ_API_KEY:
         log("Все OpenRouter модели исчерпаны, пробуем Groq...")
         return send_to_groq(payload)
 
-    log("Все модели (OpenRouter и Groq) исчерпаны")
+    log("Все модели исчерпаны")
     return None
 
 def send_to_groq(payload):
-    """Перебирает модели Groq, пока одна не сработает."""
+    """Перебирает модели Groq по порядку, останавливается на первой успешной."""
     if not GROQ_API_KEY:
         log("GROQ_API_KEY не задан")
         return None
@@ -316,29 +314,31 @@ def send_to_groq(payload):
             "max_tokens": payload.get("max_tokens", 8000),
             "temperature": payload.get("temperature", 0.1)
         }
-        for attempt in range(2):
-            try:
+        try:
+            r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
+            if r.status_code == 429:
+                wait = 5
+                log(f"Groq {groq_model} лимит, ждём {wait}с...")
+                time.sleep(wait)
                 r = requests.post(GROQ_URL, headers=headers, json=groq_payload, timeout=120)
-                if r.status_code == 429:
-                    wait = 2 ** (attempt + 1)
-                    log(f"Groq {groq_model} лимит, ждём {wait}с...")
-                    time.sleep(wait)
-                    continue
                 if r.status_code != 200:
-                    log(f"Groq {groq_model} ошибка: {r.status_code} {r.text[:300]}")
-                    break
-                response_text = r.json()["choices"][0]["message"]["content"]
-                log(f"Успешный ответ от Groq ({groq_model})")
-                match = re.search(r'\{.*\}', response_text, re.DOTALL)
-                if not match:
-                    log("Не найден JSON в ответе Groq")
+                    log(f"Groq {groq_model} всё ещё недоступна, переходим к следующей")
                     continue
-                json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
-                json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
-                return json.loads(json_str)
-            except Exception as e:
-                log(f"Groq {groq_model} попытка {attempt+1} ошибка: {e}")
-                time.sleep(2 ** attempt)
+            if r.status_code != 200:
+                log(f"Groq {groq_model} ошибка: {r.status_code} {r.text[:300]}")
+                continue
+            response_text = r.json()["choices"][0]["message"]["content"]
+            log(f"Успешный ответ от Groq ({groq_model})")
+            match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if not match:
+                log("Не найден JSON в ответе Groq, пробуем следующую модель")
+                continue
+            json_str = re.sub(r'^```(?:json)?\s*\n?', '', match.group(0), flags=re.MULTILINE)
+            json_str = re.sub(r'\n?```\s*$', '', json_str, flags=re.MULTILINE)
+            return json.loads(json_str)
+        except Exception as e:
+            log(f"Groq {groq_model} ошибка: {e}")
+            continue
     return None
 
 def analyze_with_qwen(full_text, model):
@@ -358,7 +358,7 @@ def analyze_with_qwen(full_text, model):
         "temperature": 0.1
     }
 
-    # Пробуем все модели (OpenRouter перебирает, потом Groq)
+    # Пробуем все модели (перебор только при ошибках)
     result = send_request(payload)
 
     if result:
@@ -433,23 +433,20 @@ def send_to_discord(game, title, link, raw_text):
         log(f"Вебхук для {game} не настроен")
         return
 
-    # Проверяем, не обработана ли уже новость
     if is_processed(game, title):
         log(f"Новость уже обработана: {title}")
         return
 
     log(f"Новая новость: {game}|{title}")
 
-    model = MODELS.get(game, OR_MODELS[0])  # используем первую модель как заглушку
+    model = MODELS.get(game, OR_MODELS[0])
     text_messages, image_urls = format_message(game, title, link, raw_text, model)
     if not text_messages:
         log(f"Нет сообщений для отправки ({title})")
         return
 
-    # Помечаем новость как обработанную ПЕРЕД отправкой
     mark_processed(game, title)
 
-    # Отправка текстовых сообщений
     for msg in text_messages:
         if len(msg) > 2000:
             log(f"Предупреждение: длина сообщения {len(msg)} > 2000")
@@ -459,12 +456,11 @@ def send_to_discord(game, title, link, raw_text):
             if r.status_code == 204:
                 log(f"Отправлено текстовое сообщение для {game}: {title}")
             else:
-                log(f"Ошибка Discord при отправке текста: {r.status_code} {r.text[:200]}")
+                log(f"Ошибка Discord: {r.status_code} {r.text[:200]}")
         except Exception as e:
-            log(f"Ошибка отправки текста в Discord: {e}")
+            log(f"Ошибка отправки в Discord: {e}")
         time.sleep(2)
 
-    # Отправка изображений (War Thunder)
     if image_urls and game == "warthunder":
         log(f"Отправка {len(image_urls)} изображений для {game}")
         for idx, url in enumerate(image_urls[:10]):
@@ -480,7 +476,7 @@ def send_to_discord(game, title, link, raw_text):
                 if r.status_code == 204:
                     log(f"Отправлено изображение {idx+1}: {url}")
                 else:
-                    log(f"Ошибка отправки изображения {idx+1}: {r.status_code} {r.text[:200]}")
+                    log(f"Ошибка отправки изображения {idx+1}: {r.status_code}")
             except Exception as e:
                 log(f"Ошибка отправки изображения {idx+1}: {e}")
             time.sleep(1)
@@ -491,7 +487,7 @@ def send_to_discord(game, title, link, raw_text):
             try:
                 r = requests.post(webhook, json=payload)
                 if r.status_code == 204:
-                    log("Отправлены дополнительные ссылки на изображения")
+                    log("Отправлены дополнительные ссылки")
                 else:
                     log(f"Ошибка отправки дополнительных ссылок: {r.status_code}")
             except Exception as e:
