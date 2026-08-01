@@ -96,7 +96,6 @@ SIGNS = {
     "pisces": "Рыбы"
 }
 
-# Новые источники с несколькими вариантами URL
 SOURCES = [
     {
         "name": "Mail.ru",
@@ -155,10 +154,26 @@ def fetch_horoscope(sign_key, source):
                 print(f"Ошибка {r.status_code} для {url}, пробуем следующий")
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header"]):
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
                 tag.decompose()
 
-            # Ищем по парсеру
+            # Специальный парсер для Mail.ru
+            if source["name"] == "Mail.ru":
+                candidates = []
+                for div in soup.find_all("div"):
+                    text = div.get_text(separator="\n", strip=True)
+                    if len(text) > 100:
+                        if any(word in text.lower() for word in ["звезды", "сегодня", "день", "удачно", "совет", "энергия"]):
+                            candidates.append(text)
+                if candidates:
+                    best = max(candidates, key=len)
+                    best = re.sub(r'###.*$', '', best, flags=re.MULTILINE)
+                    best = re.sub(r'\[.*?\]\(.*?\)', '', best)
+                    best = re.sub(r'\s+', ' ', best).strip()
+                    if len(best) > 50:
+                        return best
+
+            # Стандартный парсер
             content_block = source["parser"](soup)
             if content_block:
                 text = content_block.get_text(separator="\n", strip=True)
@@ -166,13 +181,12 @@ def fetch_horoscope(sign_key, source):
                 if len(text) > 50:
                     return text
 
-            # Если не нашли, ищем любой блок с большим текстом и ключевыми словами
+            # Fallback
             for div in soup.find_all("div"):
                 text = div.get_text(separator="\n", strip=True)
                 if len(text) > 200 and any(word in text.lower() for word in ["день", "сегодня", "завтра", "звезды", "гороскоп"]):
                     return text[:500] + "..." if len(text) > 500 else text
 
-            # fallback – body
             body = soup.find("body")
             if body:
                 text = body.get_text(separator="\n", strip=True)
@@ -195,10 +209,171 @@ def collect_all_horoscopes():
             time.sleep(1.5)
     return results
 
-# ---------- ОСТАЛЬНЫЕ ФУНКЦИИ (statistics, formatting, discord, flask) ----------
-# Они остаются без изменений из предыдущего кода, я их включу для полноты, но в целях экономии места я их пропущу, так как они уже были.
+# ---------- ГЕНЕРАЦИЯ СТАТИСТИКИ ПО ЗНАКАМ ----------
+SYSTEM_PROMPT_SIGN = """Ты — астрологический консультант. На основе прогнозов для знака {sign_name} дай краткий, ёмкий анализ (2–3 предложения) по пунктам:
+- взаимоотношения с партнёром / окружающими;
+- любовная тяга, романтические настроения;
+- стоит ли активно контактировать с новыми людьми или лучше побыть в одиночестве.
+Ответ на русском, без лишней воды."""
 
-# ... (вставьте сюда все функции: generate_sign_statistics, _call_ai_for_summary, build_horoscope_message, build_statistics_message, send_to_discord_horoscope, send_horoscopes, debug, home, send_horoscopes_endpoint)
+def _call_ai_for_summary(payload):
+    if OPENROUTER_API_KEY:
+        try:
+            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+            p = payload.copy()
+            p["model"] = OR_MODEL
+            r = requests.post(OPENROUTER_URL, headers=headers, json=p, timeout=120)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"].strip()
+            print(f"OpenRouter ошибка {r.status_code}")
+        except Exception as e:
+            print(f"OpenRouter исключение: {e}")
+
+    if GITHUB_TOKEN:
+        try:
+            headers = {
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Content-Type": "application/json",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            }
+            p = payload.copy()
+            p["model"] = GITHUB_MODEL
+            r = requests.post(GITHUB_URL, headers=headers, json=p, timeout=120)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"].strip()
+            print(f"GitHub ошибка {r.status_code}")
+        except Exception as e:
+            print(f"GitHub исключение: {e}")
+
+    if GROQ_API_KEY:
+        try:
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+            p = payload.copy()
+            p["model"] = GROQ_MODEL
+            r = requests.post(GROQ_URL, headers=headers, json=p, timeout=120)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"].strip()
+            print(f"Groq ошибка {r.status_code}")
+        except Exception as e:
+            print(f"Groq исключение: {e}")
+
+    return None
+
+def generate_sign_statistics(all_data):
+    stats = {}
+    for sign_key, sources in all_data.items():
+        sign_name = SIGNS[sign_key]
+        texts = [text for text in sources.values() if text]
+        if not texts:
+            stats[sign_key] = "Недостаточно данных для анализа."
+            continue
+        combined = "\n".join(texts)
+        if len(combined) > 3000:
+            combined = combined[:3000] + "..."
+        user_prompt = f"Прогнозы для {sign_name}:\n\n{combined}\n\nДай краткий анализ."
+        payload = {
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT_SIGN.format(sign_name=sign_name)},
+                {"role": "user", "content": user_prompt}
+            ],
+            "max_tokens": 300,
+            "temperature": 0.7
+        }
+        answer = _call_ai_for_summary(payload)
+        stats[sign_key] = answer if answer else "Анализ не удался."
+        time.sleep(1)
+    return stats
+
+# ---------- ФОРМИРОВАНИЕ СООБЩЕНИЙ ДЛЯ DISCORD ----------
+def build_horoscope_message(all_data):
+    today = datetime.date.today().strftime("%d %B %Y")
+    header = f"🔮 **Астропрогнозы на {today}**\n\n"
+    parts = [header]
+    for sign_key, sources in all_data.items():
+        sign_name = SIGNS[sign_key]
+        sign_block = f"**{sign_name}**\n"
+        for src, text in sources.items():
+            if text:
+                short = text[:300] + ("..." if len(text) > 300 else "")
+                sign_block += f"• *{src}:* {short}\n"
+            else:
+                sign_block += f"• *{src}:* (не удалось получить)\n"
+        sign_block += "\n"
+        parts.append(sign_block)
+    full = "\n".join(parts)
+    messages = []
+    while len(full) > 2000:
+        split_at = full.rfind("\n\n", 0, 2000)
+        if split_at == -1:
+            split_at = 2000
+        messages.append(full[:split_at])
+        full = full[split_at:].lstrip()
+    if full:
+        messages.append(full)
+    return messages
+
+def build_statistics_message(stats):
+    today = datetime.date.today().strftime("%d %B %Y")
+    header = f"📊 **Статистика и рекомендации на {today}**\n\n"
+    parts = [header]
+    for sign_key, analysis in stats.items():
+        sign_name = SIGNS[sign_key]
+        parts.append(f"**{sign_name}** — {analysis}\n")
+    full = "\n".join(parts)
+    messages = []
+    while len(full) > 2000:
+        split_at = full.rfind("\n\n", 0, 2000)
+        if split_at == -1:
+            split_at = 2000
+        messages.append(full[:split_at])
+        full = full[split_at:].lstrip()
+    if full:
+        messages.append(full)
+    return messages
+
+def send_to_discord_horoscope(messages):
+    if not DISCORD_WEBHOOK_HOROSCOPE:
+        print("DISCORD_WEBHOOK_HOROSCOPE не задан!")
+        return
+    for msg in messages:
+        payload = {"content": msg, "allowed_mentions": {"parse": []}}
+        try:
+            r = requests.post(DISCORD_WEBHOOK_HOROSCOPE, json=payload)
+            if r.status_code == 204:
+                print("Сообщение отправлено в Discord")
+            else:
+                print(f"Ошибка Discord: {r.status_code} - {r.text}")
+        except Exception as e:
+            print(f"Ошибка отправки: {e}")
+        time.sleep(1)
+
+# ---------- ГЛАВНАЯ ФУНКЦИЯ ----------
+def send_horoscopes():
+    if is_horoscope_sent_today():
+        print("Астропрогнозы на сегодня уже отправлены. Выход.")
+        return
+
+    print("Начинаем сбор астропрогнозов...")
+    all_data = collect_all_horoscopes()
+    if not all_data:
+        print("Не удалось собрать прогнозы.")
+        return
+
+    print("Генерируем статистику по знакам...")
+    stats = generate_sign_statistics(all_data)
+
+    msg1 = build_horoscope_message(all_data)
+    msg2 = build_statistics_message(stats)
+
+    print("Отправляем прогнозы...")
+    send_to_discord_horoscope(msg1)
+    time.sleep(2)
+    print("Отправляем статистику...")
+    send_to_discord_horoscope(msg2)
+
+    mark_horoscope_sent_today()
+    print("Астропрогнозы и статистика отправлены!")
 
 # ---------- ОТЛАДОЧНЫЙ ЭНДПОИНТ ----------
 @app.route("/debug/<sign>")
