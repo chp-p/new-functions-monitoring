@@ -2,8 +2,10 @@ import os
 import time
 import datetime
 import requests
+import re
 import json
 from flask import Flask
+from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
 app = Flask(__name__)
@@ -31,22 +33,24 @@ SUPABASE_ENABLED = False
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        # Проверим наличие таблицы
         supabase.table("horoscope_sent").select("*").limit(1).execute()
         SUPABASE_ENABLED = True
-        print("✅ Supabase подключен (horoscope).")
+        print("✅ Supabase подключен.")
     except Exception as e:
-        print(f"⚠️ Ошибка Supabase: {e}")
+        print(f"⚠️ Ошибка Supabase: {e} (будет использован файловый кеш)")
         SUPABASE_ENABLED = False
 
-# ---------- ФУНКЦИИ БАЗЫ ДАННЫХ ----------
+# ---------- ФУНКЦИИ БАЗЫ ДАННЫХ (кеш) ----------
 def is_horoscope_sent_today():
     today = datetime.date.today().isoformat()
     if SUPABASE_ENABLED and supabase:
         try:
             resp = supabase.table("horoscope_sent").select("*").eq("date", today).execute()
             return len(resp.data) > 0
-        except Exception as e:
-            print(f"Ошибка Supabase: {e}")
+        except:
+            pass
+    # Файловый кеш (на случай проблем с БД)
     try:
         cache_file = "/tmp/horoscope_sent.txt"
         if not os.access("/tmp", os.W_OK):
@@ -63,22 +67,23 @@ def mark_horoscope_sent_today():
     if SUPABASE_ENABLED and supabase:
         try:
             supabase.table("horoscope_sent").upsert({"date": today, "sent": True}, on_conflict="date").execute()
-            print(f"Записано в Supabase: {today}")
+            print(f"✅ Записано в Supabase: {today}")
             return
-        except Exception as e:
-            print(f"Ошибка записи: {e}")
+        except:
+            pass
     try:
         cache_file = "/tmp/horoscope_sent.txt"
         if not os.access("/tmp", os.W_OK):
             cache_file = "horoscope_sent.txt"
         with open(cache_file, "a") as f:
             f.write(f"{today}\n")
-        print(f"Записано в кеш: {today}")
-    except Exception as e:
-        print(f"Ошибка записи в кеш: {e}")
+        print(f"✅ Записано в файловый кеш: {today}")
+    except:
+        pass
 
-# ---------- ПОЛУЧЕНИЕ ПРОГНОЗОВ ЧЕРЕЗ API ----------
-SIGNS = {
+# ---------- ПАРСИНГ ПРОГНОЗОВ ----------
+# Словари знаков
+SIGNS_EN = {
     "aries": "Овен",
     "taurus": "Телец",
     "gemini": "Близнецы",
@@ -93,52 +98,104 @@ SIGNS = {
     "pisces": "Рыбы"
 }
 
-# Бесплатный API для гороскопов (не требует ключа)
-HOROSCOPE_API_URL = "https://horoscope-app-api.vercel.app/api/v1/get-horoscope/daily"
+SIGNS_RU = {v: k for k, v in SIGNS_EN.items()}  # для обратного поиска
 
-def fetch_horoscope_from_api(sign_key):
-    """Получает прогноз через бесплатный API."""
-    sign_name = SIGNS.get(sign_key, sign_key)
+# Два проверенных источника
+SOURCES = [
+    {
+        "name": "1001goroskop",
+        "url": "https://1001goroskop.ru/daily/{sign_ru}.html",
+        "selector": lambda soup: (
+            soup.find("div", class_="text") or
+            soup.find("div", class_="content") or
+            soup.find("article") or
+            soup.find("div", class_=re.compile(r"text|content"))
+        ),
+        "sign_format": "ru"
+    },
+    {
+        "name": "goroskop.ru",
+        "url": "https://goroskop.ru/daily/{sign_en}/",
+        "selector": lambda soup: (
+            soup.find("div", class_="text") or
+            soup.find("div", class_="content") or
+            soup.find("div", class_=re.compile(r"text|content")) or
+            soup.find("article")
+        ),
+        "sign_format": "en"
+    }
+]
+
+def fetch_horoscope_from_source(sign_key, source):
+    """Парсит прогноз с одного источника"""
+    if source["sign_format"] == "ru":
+        sign_part = SIGNS_EN[sign_key].lower()  # "овен", "телец" ...
+    else:
+        sign_part = sign_key  # "aries", "taurus" ...
+    url = source["url"].format(sign_ru=sign_part, sign_en=sign_part)
     try:
-        # API ожидает знак на английском
-        params = {"sign": sign_key, "day": "TODAY"}
-        print(f"Запрос к API для {sign_name}...")
-        r = requests.get(HOROSCOPE_API_URL, params=params, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("success") and data.get("data"):
-                horoscope_text = data["data"].get("horoscope_data", "")
-                if horoscope_text:
-                    print(f"✅ Получен прогноз для {sign_name}")
-                    return horoscope_text
-        print(f"❌ Ошибка API для {sign_name}: {r.status_code}")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "ru-RU,ru;q=0.8"
+        }
+        r = requests.get(url, timeout=15, headers=headers)
+        if r.status_code != 200:
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        # Удаляем мусор
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        # Ищем блок
+        block = source["selector"](soup)
+        if block:
+            text = block.get_text(separator="\n", strip=True)
+            text = re.sub(r'\s+', ' ', text).strip()
+            text = re.sub(r'Подпишись.*?\.', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'Реклама.*?\.', '', text, flags=re.IGNORECASE)
+            if len(text) > 50:
+                return text
+        # fallback: ищем любой div с текстом > 200 символов
+        for div in soup.find_all("div"):
+            txt = div.get_text(separator="\n", strip=True)
+            if len(txt) > 200 and any(w in txt.lower() for w in ["сегодня", "день", "звезды", "удачи", "совет"]):
+                txt = re.sub(r'\s+', ' ', txt).strip()
+                return txt[:500] + "..." if len(txt) > 500 else txt
         return None
     except Exception as e:
-        print(f"❌ Исключение при запросе API для {sign_name}: {e}")
+        print(f"Ошибка парсинга {source['name']} для {SIGNS_EN[sign_key]}: {e}")
         return None
 
-def collect_all_horoscopes():
-    """Собирает прогнозы для всех знаков через API."""
+def fetch_all_horoscopes():
+    """Собирает прогнозы для всех знаков со всех источников"""
     results = {}
-    for sign_key in SIGNS:
+    for sign_key in SIGNS_EN:
         results[sign_key] = {}
-        text = fetch_horoscope_from_api(sign_key)
-        results[sign_key]["API"] = text if text else None
-        time.sleep(1)  # пауза между запросами
+        for source in SOURCES:
+            text = fetch_horoscope_from_source(sign_key, source)
+            results[sign_key][source["name"]] = text
+            time.sleep(1)  # пауза между запросами
+        time.sleep(1.5)   # пауза между знаками
     return results
 
-# ---------- ГЕНЕРАЦИЯ СТАТИСТИКИ ПО ЗНАКАМ (через ИИ) ----------
-# Промпт с явным указанием языка — РУССКИЙ
-SYSTEM_PROMPT_SIGN = """Ты — астрологический консультант. Ты ОБЯЗАН отвечать только на РУССКОМ языке.
-На основе прогнозов для знака {sign_name} дай краткий, ёмкий анализ (2–3 предложения) по пунктам:
-- взаимоотношения с партнёром / окружающими;
-- любовная тяга, романтические настроения;
-- стоит ли активно контактировать с новыми людьми или лучше побыть в одиночестве.
+# ---------- ГЕНЕРАЦИЯ СТАТИСТИКИ ЧЕРЕЗ ИИ ----------
+SYSTEM_PROMPT = """Ты — астролог-консультант. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ.
+На основе прогнозов для знака {sign} дай краткий (2-3 предложения) анализ:
+- отношения с партнёром / окружающими
+- любовная энергетика
+- стоит ли сегодня активно общаться или лучше побыть в одиночестве
+Без воды, только суть."""
 
-ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. Без лишней воды, только по делу."""
-
-def _call_ai_for_summary(payload):
-    """Отправляет запрос к ИИ (OpenRouter -> GitHub -> Groq)."""
+def call_ai(prompt):
+    """Отправляет запрос к ИИ (OpenRouter -> GitHub -> Groq)"""
+    payload = {
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 300,
+        "temperature": 0.7
+    }
+    # Пробуем OpenRouter
     if OPENROUTER_API_KEY:
         try:
             headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
@@ -147,10 +204,9 @@ def _call_ai_for_summary(payload):
             r = requests.post(OPENROUTER_URL, headers=headers, json=p, timeout=120)
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]["content"].strip()
-            print(f"OpenRouter ошибка {r.status_code}")
-        except Exception as e:
-            print(f"OpenRouter исключение: {e}")
-
+        except:
+            pass
+    # Пробуем GitHub
     if GITHUB_TOKEN:
         try:
             headers = {
@@ -164,10 +220,9 @@ def _call_ai_for_summary(payload):
             r = requests.post(GITHUB_URL, headers=headers, json=p, timeout=120)
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]["content"].strip()
-            print(f"GitHub ошибка {r.status_code}")
-        except Exception as e:
-            print(f"GitHub исключение: {e}")
-
+        except:
+            pass
+    # Пробуем Groq
     if GROQ_API_KEY:
         try:
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
@@ -176,149 +231,132 @@ def _call_ai_for_summary(payload):
             r = requests.post(GROQ_URL, headers=headers, json=p, timeout=120)
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]["content"].strip()
-            print(f"Groq ошибка {r.status_code}")
-        except Exception as e:
-            print(f"Groq исключение: {e}")
-
+        except:
+            pass
     return None
 
-def generate_sign_statistics(all_data):
-    """Генерирует анализ для каждого знака через ИИ."""
+def generate_statistics(all_data):
     stats = {}
     for sign_key, sources in all_data.items():
-        sign_name = SIGNS[sign_key]
-        texts = [text for text in sources.values() if text]
+        sign_name = SIGNS_EN[sign_key]
+        texts = [t for t in sources.values() if t]
         if not texts:
-            stats[sign_key] = "Недостаточно данных для анализа."
+            stats[sign_key] = "Недостаточно данных."
             continue
         combined = "\n".join(texts)
         if len(combined) > 3000:
             combined = combined[:3000] + "..."
-        user_prompt = f"Прогнозы для {sign_name}:\n\n{combined}\n\nДай краткий анализ на РУССКОМ языке."
-        payload = {
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT_SIGN.format(sign_name=sign_name)},
-                {"role": "user", "content": user_prompt}
-            ],
-            "max_tokens": 300,
-            "temperature": 0.7
-        }
-        answer = _call_ai_for_summary(payload)
+        prompt = f"Знак: {sign_name}\nПрогнозы:\n{combined}\n\nДай краткий анализ на русском."
+        answer = call_ai(prompt)
         stats[sign_key] = answer if answer else "Анализ не удался."
         time.sleep(1)
     return stats
 
 # ---------- ФОРМИРОВАНИЕ СООБЩЕНИЙ ДЛЯ DISCORD ----------
-def build_horoscope_message(all_data):
+def build_messages(all_data, stats):
     today = datetime.date.today().strftime("%d %B %Y")
-    header = f"🔮 **Астропрогнозы на {today}**\n\n"
-    parts = [header]
+    # Первое сообщение: прогнозы
+    parts1 = [f"🔮 **Астропрогнозы на {today}**\n"]
     for sign_key, sources in all_data.items():
-        sign_name = SIGNS[sign_key]
-        sign_block = f"**{sign_name}**\n"
+        sign_name = SIGNS_EN[sign_key]
+        block = f"**{sign_name}**\n"
         for src, text in sources.items():
             if text:
                 short = text[:300] + ("..." if len(text) > 300 else "")
-                sign_block += f"• *{src}:* {short}\n"
+                block += f"• *{src}:* {short}\n"
             else:
-                sign_block += f"• *{src}:* (не удалось получить)\n"
-        sign_block += "\n"
-        parts.append(sign_block)
-    full = "\n".join(parts)
-    messages = []
-    while len(full) > 2000:
-        split_at = full.rfind("\n\n", 0, 2000)
-        if split_at == -1:
-            split_at = 2000
-        messages.append(full[:split_at])
-        full = full[split_at:].lstrip()
-    if full:
-        messages.append(full)
-    return messages
+                block += f"• *{src}:* (не удалось получить)\n"
+        block += "\n"
+        parts1.append(block)
+    msg1 = "\n".join(parts1)
 
-def build_statistics_message(stats):
-    today = datetime.date.today().strftime("%d %B %Y")
-    header = f"📊 **Статистика и рекомендации на {today}**\n\n"
-    parts = [header]
+    # Второе сообщение: статистика
+    parts2 = [f"📊 **Статистика и рекомендации на {today}**\n"]
     for sign_key, analysis in stats.items():
-        sign_name = SIGNS[sign_key]
-        parts.append(f"**{sign_name}** — {analysis}\n")
-    full = "\n".join(parts)
-    messages = []
-    while len(full) > 2000:
-        split_at = full.rfind("\n\n", 0, 2000)
-        if split_at == -1:
-            split_at = 2000
-        messages.append(full[:split_at])
-        full = full[split_at:].lstrip()
-    if full:
-        messages.append(full)
-    return messages
+        sign_name = SIGNS_EN[sign_key]
+        parts2.append(f"**{sign_name}** — {analysis}\n")
+    msg2 = "\n".join(parts2)
 
-def send_to_discord_horoscope(messages):
+    # Разбиваем на части по 2000 символов
+    def split_text(text):
+        chunks = []
+        while len(text) > 2000:
+            split_at = text.rfind("\n", 0, 2000)
+            if split_at == -1:
+                split_at = 2000
+            chunks.append(text[:split_at])
+            text = text[split_at:].lstrip()
+        chunks.append(text)
+        return chunks
+
+    return split_text(msg1), split_text(msg2)
+
+def send_to_discord(messages):
     if not DISCORD_WEBHOOK_HOROSCOPE:
-        print("DISCORD_WEBHOOK_HOROSCOPE не задан!")
+        print("❌ DISCORD_WEBHOOK_HOROSCOPE не задан!")
         return
     for msg in messages:
         payload = {"content": msg, "allowed_mentions": {"parse": []}}
         try:
             r = requests.post(DISCORD_WEBHOOK_HOROSCOPE, json=payload)
             if r.status_code == 204:
-                print("Сообщение отправлено в Discord")
+                print("✅ Сообщение отправлено")
             else:
-                print(f"Ошибка Discord: {r.status_code} - {r.text}")
+                print(f"❌ Ошибка Discord: {r.status_code}")
         except Exception as e:
-            print(f"Ошибка отправки: {e}")
+            print(f"❌ Ошибка отправки: {e}")
         time.sleep(1)
 
-# ---------- ГЛАВНАЯ ФУНКЦИЯ ----------
+# ---------- ОСНОВНАЯ ФУНКЦИЯ ----------
 def send_horoscopes():
     if is_horoscope_sent_today():
-        print("Астропрогнозы на сегодня уже отправлены. Выход.")
+        print("⏳ Прогнозы на сегодня уже отправлены. Выход.")
         return
 
-    print("Начинаем сбор астропрогнозов через API...")
-    all_data = collect_all_horoscopes()
-    if not all_data:
-        print("Не удалось собрать прогнозы.")
+    print("🔄 Начинаем сбор прогнозов...")
+    all_data = fetch_all_horoscopes()
+    # Проверяем, есть ли хоть один текст
+    has_data = any(any(t for t in sources.values()) for sources in all_data.values())
+    if not has_data:
+        print("❌ Не удалось получить ни одного прогноза.")
         return
 
-    print("Генерируем статистику по знакам...")
-    stats = generate_sign_statistics(all_data)
+    print("🧠 Генерируем статистику через ИИ...")
+    stats = generate_statistics(all_data)
 
-    msg1 = build_horoscope_message(all_data)
-    msg2 = build_statistics_message(stats)
+    msg1_chunks, msg2_chunks = build_messages(all_data, stats)
 
-    print("Отправляем прогнозы...")
-    send_to_discord_horoscope(msg1)
+    print("📨 Отправляем в Discord...")
+    send_to_discord(msg1_chunks)
     time.sleep(2)
-    print("Отправляем статистику...")
-    send_to_discord_horoscope(msg2)
+    send_to_discord(msg2_chunks)
 
     mark_horoscope_sent_today()
-    print("Астропрогнозы и статистика отправлены!")
+    print("✅ Готово!")
 
-# ---------- ОТЛАДОЧНЫЙ ЭНДПОИНТ ----------
-@app.route("/debug/<sign>")
-def debug(sign):
-    if sign not in SIGNS:
-        return "Неверный знак", 400
-    text = fetch_horoscope_from_api(sign)
-    return json.dumps({
-        "sign": sign,
-        "name": SIGNS[sign],
-        "horoscope": text
-    }, ensure_ascii=False, indent=2)
-
-# ---------- FLASK ----------
+# ---------- FLASK ЭНДПОИНТЫ ----------
 @app.route("/")
 def home():
-    return "Horoscope bot is running (API version)"
+    return "Horoscope bot is running (final version)"
 
 @app.route("/send_horoscopes")
 def send_horoscopes_endpoint():
     send_horoscopes()
     return "OK", 200
+
+@app.route("/debug/<sign>")
+def debug(sign):
+    if sign not in SIGNS_EN:
+        return "Неверный знак", 400
+    results = {}
+    for source in SOURCES:
+        text = fetch_horoscope_from_source(sign, source)
+        results[source["name"]] = text
+    return json.dumps({
+        "sign": sign,
+        "name": SIGNS_EN[sign],
+        "sources": results
+    }, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10001))
