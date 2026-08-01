@@ -34,15 +34,11 @@ SUPABASE_ENABLED = False
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        # Проверим таблицу horoscope_sent
-        try:
-            supabase.table("horoscope_sent").select("*").limit(1).execute()
-        except Exception:
-            print("⚠️ Таблица horoscope_sent не найдена. Создайте её.")
+        supabase.table("horoscope_sent").select("*").limit(1).execute()
         SUPABASE_ENABLED = True
         print("✅ Supabase подключен (horoscope).")
     except Exception as e:
-        print(f"⚠️ Ошибка подключения к Supabase: {e}")
+        print(f"⚠️ Ошибка Supabase: {e}")
         SUPABASE_ENABLED = False
 
 # ---------- ФУНКЦИИ БАЗЫ ДАННЫХ ----------
@@ -54,7 +50,6 @@ def is_horoscope_sent_today():
             return len(resp.data) > 0
         except Exception as e:
             print(f"Ошибка Supabase: {e}")
-    # Файловый кеш
     try:
         cache_file = "/tmp/horoscope_sent.txt"
         if not os.access("/tmp", os.W_OK):
@@ -101,13 +96,11 @@ SIGNS = {
     "pisces": "Рыбы"
 }
 
-# ------------------------------------------------
-# Улучшенные источники с гибкими парсерами
-# ------------------------------------------------
+# Расширенные источники
 SOURCES = [
     {
         "name": "7Дней.ру",
-        "url_template": "https://www.7days.ru/horoscope/{sign}/",  # убрал /today/
+        "url_template": "https://www.7days.ru/horoscope/{sign}/",
         "parser": lambda soup: (
             soup.find("div", class_="horoscope-text") or
             soup.find("div", class_="article-text") or
@@ -136,11 +129,29 @@ SOURCES = [
             soup.find("div", class_=re.compile(r"horoscope|content|text|entry")) or
             soup.find("article")
         )
+    },
+    {
+        "name": "Horo.mail.ru",
+        "url_template": "https://horo.mail.ru/prediction/{sign}/today/",
+        "parser": lambda soup: (
+            soup.find("div", class_="prediction-text") or
+            soup.find("div", class_=re.compile(r"prediction|text|content")) or
+            soup.find("article")
+        )
+    },
+    {
+        "name": "Ignio.com",
+        "url_template": "https://www.ignio.com/r/daily/{sign}.html",
+        "parser": lambda soup: (
+            soup.find("div", class_="horoscope-content") or
+            soup.find("div", class_="daily-horoscope") or
+            soup.find("div", class_=re.compile(r"horoscope|content")) or
+            soup.find("article")
+        )
     }
 ]
 
 def fetch_horoscope(sign_key, source):
-    """Возвращает текст прогноза или None."""
     sign_name = SIGNS.get(sign_key, sign_key)
     url = source["url_template"].format(sign=sign_key)
     try:
@@ -170,7 +181,7 @@ def fetch_horoscope(sign_key, source):
         for div in soup.find_all("div"):
             text = div.get_text(separator="\n", strip=True)
             if len(text) > 200:
-                # Проверим, что текст похож на прогноз (содержит слова "день", "сегодня" и т.п.)
+                # Проверим, что текст похож на прогноз
                 if any(word in text.lower() for word in ["день", "сегодня", "завтра", "звезды", "гороскоп"]):
                     return text[:500] + "..." if len(text) > 500 else text
 
@@ -197,13 +208,12 @@ def collect_all_horoscopes():
             time.sleep(1.5)
     return results
 
-# ---------- ГЕНЕРАЦИЯ СТАТИСТИКИ ПО КАЖДОМУ ЗНАКУ ----------
-SYSTEM_PROMPT_SIGN = """Ты — астрологический консультант. На основе прогнозов для знака {sign_name} дай краткий, ёмкий анализ (2–3 предложения) по следующим пунктам:
+# ---------- ГЕНЕРАЦИЯ СТАТИСТИКИ ПО ЗНАКАМ ----------
+SYSTEM_PROMPT_SIGN = """Ты — астрологический консультант. На основе прогнозов для знака {sign_name} дай краткий, ёмкий анализ (2–3 предложения) по пунктам:
 - взаимоотношения с партнёром / окружающими;
 - любовная тяга, романтические настроения;
 - стоит ли активно контактировать с новыми людьми или лучше побыть в одиночестве.
-
-Ответ должен быть на русском языке, без лишней воды, только по делу."""
+Ответ на русском, без лишней воды."""
 
 def _call_ai_for_summary(payload):
     if OPENROUTER_API_KEY:
@@ -284,7 +294,6 @@ def build_horoscope_message(all_data):
         sign_block = f"**{sign_name}**\n"
         for src, text in sources.items():
             if text:
-                # Обрезаем до 300 символов
                 short = text[:300] + ("..." if len(text) > 300 else "")
                 sign_block += f"• *{src}:* {short}\n"
             else:
@@ -364,6 +373,28 @@ def send_horoscopes():
 
     mark_horoscope_sent_today()
     print("Астропрогнозы и статистика отправлены!")
+
+# ---------- ОТЛАДОЧНЫЙ ЭНДПОИНТ ----------
+@app.route("/debug/<sign>")
+def debug(sign):
+    if sign not in SIGNS:
+        return "Неверный знак", 400
+    results = {}
+    for source in SOURCES:
+        url = source["url_template"].format(sign=sign)
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "ru-RU,ru;q=0.8"
+            }
+            r = requests.get(url, timeout=10, headers=headers)
+            results[source["name"]] = {
+                "status": r.status_code,
+                "preview": r.text[:1000] if r.status_code == 200 else None
+            }
+        except Exception as e:
+            results[source["name"]] = {"error": str(e)}
+    return json.dumps(results, ensure_ascii=False, indent=2)
 
 # ---------- FLASK ----------
 @app.route("/")
