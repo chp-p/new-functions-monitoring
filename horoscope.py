@@ -2,10 +2,8 @@ import os
 import time
 import datetime
 import requests
-import re
 import json
 from flask import Flask
-from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
 app = Flask(__name__)
@@ -37,8 +35,7 @@ if SUPABASE_URL and SUPABASE_KEY:
         SUPABASE_ENABLED = True
         print("✅ Supabase подключен.")
     except Exception as e:
-        print(f"⚠️ Ошибка Supabase: {e} (используем файловый кеш)")
-        SUPABASE_ENABLED = False
+        print(f"⚠️ Ошибка Supabase: {e}")
 
 # ---------- КЕШ ----------
 def is_horoscope_sent_today():
@@ -79,7 +76,7 @@ def mark_horoscope_sent_today():
     except:
         pass
 
-# ---------- ПАРСИНГ ----------
+# ---------- ПОЛУЧЕНИЕ ПРОГНОЗОВ ЧЕРЕЗ API ----------
 SIGNS = {
     "aries": "Овен",
     "taurus": "Телец",
@@ -95,108 +92,42 @@ SIGNS = {
     "pisces": "Рыбы"
 }
 
-# Сопоставление для русских названий в URL
-SIGN_RU = {k: v.lower() for k, v in SIGNS.items()}  # "taurus": "телец"
-
-# Три надёжных источника
-SOURCES = [
-    {
-        "name": "ignio.com",
-        "url": "https://www.ignio.com/r/daily/{sign}.html",
-        "parser": lambda soup: (
-            soup.find("div", class_="horoscope-content") or
-            soup.find("div", class_="daily-horoscope") or
-            soup.find("div", class_="content") or
-            soup.find("article")
-        )
-    },
-    {
-        "name": "astro.ru",
-        "url": "https://astro.ru/horoscope/{sign}/today/",
-        "parser": lambda soup: (
-            soup.find("div", class_="horoscope-text") or
-            soup.find("div", class_="content") or
-            soup.find("article")
-        )
-    },
-    {
-        "name": "1001goroskop",
-        "url": "https://1001goroskop.ru/daily/{sign_ru}.html",
-        "parser": lambda soup: (
-            soup.find("div", class_="text") or
-            soup.find("div", class_="content") or
-            soup.find("article")
-        )
-    }
-]
-
-def fetch_horoscope(sign_key):
-    """Парсит прогнозы со всех источников и возвращает словарь {source_name: text}"""
-    results = {}
-    for source in SOURCES:
-        # Подставляем нужный формат знака
-        if "sign_ru" in source["url"]:
-            sign_part = SIGN_RU[sign_key]
-        else:
-            sign_part = sign_key
-        url = source["url"].format(sign=sign_part, sign_ru=sign_part)
-        try:
-            print(f"🔍 Пробуем {source['name']} для {SIGNS[sign_key]}: {url}")
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept-Language": "ru-RU,ru;q=0.8",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-            }
-            r = requests.get(url, timeout=15, headers=headers)
-            if r.status_code != 200:
-                print(f"   ❌ HTTP {r.status_code}")
-                results[source["name"]] = None
-                continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            # Удаляем мусор
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                tag.decompose()
-            # Ищем блок по парсеру
-            block = source["parser"](soup)
-            text = None
-            if block:
-                text = block.get_text(separator="\n", strip=True)
-                text = re.sub(r'\s+', ' ', text).strip()
-                text = re.sub(r'Подпишись.*?\.', '', text, flags=re.IGNORECASE)
-                text = re.sub(r'Реклама.*?\.', '', text, flags=re.IGNORECASE)
-                if len(text) > 50:
-                    print(f"   ✅ Найден текст ({len(text)} симв.)")
-                    results[source["name"]] = text
-                    continue
-            # Fallback: ищем любой div с большим текстом и ключевыми словами
-            for div in soup.find_all("div"):
-                txt = div.get_text(separator="\n", strip=True)
-                if len(txt) > 200 and any(w in txt.lower() for w in ["сегодня", "день", "звезды", "удачи", "совет"]):
-                    txt = re.sub(r'\s+', ' ', txt).strip()
-                    if len(txt) > 50:
-                        print(f"   ✅ Fallback текст ({len(txt)} симв.)")
-                        results[source["name"]] = txt[:500] + "..." if len(txt) > 500 else txt
-                        break
-            if source["name"] not in results:
-                results[source["name"]] = None
-                print("   ❌ Не удалось извлечь текст")
-        except Exception as e:
-            print(f"   ❌ Ошибка: {e}")
-            results[source["name"]] = None
-        time.sleep(1)  # пауза между источниками
-    return results
+def fetch_from_api(sign_key):
+    """Получает прогноз через бесплатный API (aztro)"""
+    try:
+        url = "https://aztro.sameerkumar.website/"
+        params = {"sign": sign_key, "day": "today"}
+        r = requests.post(url, data=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("description"):
+                return data["description"]
+    except Exception as e:
+        print(f"API aztro ошибка: {e}")
+    # Резервный API
+    try:
+        url = f"https://horoscope-api.vercel.app/api/v1/get-horoscope/daily?sign={sign_key}&day=today"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("data", {}).get("horoscope_data"):
+                return data["data"]["horoscope_data"]
+    except Exception as e:
+        print(f"API horoscope-api ошибка: {e}")
+    return None
 
 def collect_all_horoscopes():
     results = {}
     for sign_key in SIGNS:
-        print(f"\n📡 Обработка знака {SIGNS[sign_key]}...")
-        results[sign_key] = fetch_horoscope(sign_key)
-        time.sleep(2)  # пауза между знаками
+        print(f"📡 Запрос API для {SIGNS[sign_key]}...")
+        text = fetch_from_api(sign_key)
+        results[sign_key] = {"API": text}  # только один источник
+        time.sleep(1.5)
     return results
 
 # ---------- ГЕНЕРАЦИЯ СТАТИСТИКИ ЧЕРЕЗ ИИ ----------
 SYSTEM_PROMPT = """Ты — астролог-консультант. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ.
-На основе прогнозов для знака {sign} дай краткий (2-3 предложения) анализ:
+На основе прогноза для знака {sign} (на английском) дай краткий (2-3 предложения) анализ на русском:
 - отношения с партнёром / окружающими
 - любовная энергетика
 - стоит ли сегодня активно общаться или лучше побыть в одиночестве
@@ -252,14 +183,11 @@ def generate_statistics(all_data):
     stats = {}
     for sign_key, sources in all_data.items():
         sign_name = SIGNS[sign_key]
-        texts = [t for t in sources.values() if t]
-        if not texts:
-            stats[sign_key] = "Недостаточно данных."
+        text = sources.get("API")
+        if not text:
+            stats[sign_key] = "Прогноз не получен."
             continue
-        combined = "\n".join(texts)
-        if len(combined) > 3000:
-            combined = combined[:3000] + "..."
-        prompt = f"Знак: {sign_name}\nПрогнозы:\n{combined}\n\nДай краткий анализ на русском."
+        prompt = f"Знак: {sign_name}\nПрогноз (на английском): {text}\n\nПереведи на русский и дай краткий анализ."
         answer = call_ai(prompt)
         stats[sign_key] = answer if answer else "Анализ не удался."
         time.sleep(1)
@@ -279,20 +207,19 @@ def split_text(text):
 
 def build_messages(all_data, stats):
     today = datetime.date.today().strftime("%d %B %Y")
+    # Первое сообщение: прогнозы (оригинал на английском)
     parts1 = [f"🔮 **Астропрогнозы на {today}**\n"]
     for sign_key, sources in all_data.items():
         sign_name = SIGNS[sign_key]
-        block = f"**{sign_name}**\n"
-        for src, text in sources.items():
-            if text:
-                short = text[:300] + ("..." if len(text) > 300 else "")
-                block += f"• *{src}:* {short}\n"
-            else:
-                block += f"• *{src}:* (не удалось)\n"
-        block += "\n"
-        parts1.append(block)
+        text = sources.get("API")
+        if text:
+            short = text[:300] + ("..." if len(text) > 300 else "")
+            parts1.append(f"**{sign_name}**: {short}\n")
+        else:
+            parts1.append(f"**{sign_name}**: (не удалось получить)\n")
     msg1 = "\n".join(parts1)
 
+    # Второе сообщение: статистика (перевод + анализ на русском)
     parts2 = [f"📊 **Статистика и рекомендации на {today}**\n"]
     for sign_key, analysis in stats.items():
         sign_name = SIGNS[sign_key]
@@ -323,10 +250,10 @@ def send_horoscopes():
         print("⏳ Сегодня уже отправлено. Выход.")
         return
 
-    print("🔄 Сбор прогнозов...")
+    print("🔄 Сбор прогнозов через API...")
     all_data = collect_all_horoscopes()
     # Проверяем, есть ли хоть один текст
-    has_data = any(any(t for t in sources.values()) for sources in all_data.values())
+    has_data = any(sources.get("API") for sources in all_data.values())
     if not has_data:
         print("❌ Нет данных. Отправка отменена.")
         return
@@ -347,7 +274,7 @@ def send_horoscopes():
 # ---------- FLASK ----------
 @app.route("/")
 def home():
-    return "Horoscope bot is running (final)"
+    return "Horoscope bot is running (API version)"
 
 @app.route("/send_horoscopes")
 def send():
@@ -358,11 +285,11 @@ def send():
 def debug(sign):
     if sign not in SIGNS:
         return "Неверный знак", 400
-    results = fetch_horoscope(sign)
+    text = fetch_from_api(sign)
     return json.dumps({
         "sign": sign,
         "name": SIGNS[sign],
-        "sources": results
+        "horoscope": text
     }, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
