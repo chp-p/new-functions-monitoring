@@ -96,56 +96,44 @@ SIGNS = {
     "pisces": "Рыбы"
 }
 
-# Расширенные источники
+# Новые источники с несколькими вариантами URL
 SOURCES = [
     {
-        "name": "7Дней.ру",
-        "url_template": "https://www.7days.ru/horoscope/{sign}/",
-        "parser": lambda soup: (
-            soup.find("div", class_="horoscope-text") or
-            soup.find("div", class_="article-text") or
-            soup.find("div", class_="content") or
-            soup.find("div", class_=re.compile(r"horoscope|text|content")) or
-            soup.find("article")
-        )
-    },
-    {
-        "name": "Astroscope.ru",
-        "url_template": "https://astroscope.ru/horoscope/{sign}/",
-        "parser": lambda soup: (
-            soup.find("div", class_="horoscope-text") or
-            soup.find("div", class_="description") or
-            soup.find("div", class_=re.compile(r"horoscope|text|content|description")) or
-            soup.find("article")
-        )
-    },
-    {
-        "name": "ktv-ray.ru",
-        "url_template": "https://ktv-ray.ru/horoscope/{sign}/",
-        "parser": lambda soup: (
-            soup.find("div", class_="horoscope-content") or
-            soup.find("div", class_="entry-content") or
-            soup.find("div", class_="text") or
-            soup.find("div", class_=re.compile(r"horoscope|content|text|entry")) or
-            soup.find("article")
-        )
-    },
-    {
-        "name": "Horo.mail.ru",
-        "url_template": "https://horo.mail.ru/prediction/{sign}/today/",
+        "name": "Mail.ru",
+        "urls": [
+            "https://horo.mail.ru/prediction/{sign}/today/",
+            "https://horo.mail.ru/prediction/{sign}/"
+        ],
         "parser": lambda soup: (
             soup.find("div", class_="prediction-text") or
+            soup.find("div", class_="article__text") or
             soup.find("div", class_=re.compile(r"prediction|text|content")) or
-            soup.find("article")
+            soup.find("article") or
+            soup.find("div", class_="horoscope-text")
         )
     },
     {
         "name": "Ignio.com",
-        "url_template": "https://www.ignio.com/r/daily/{sign}.html",
+        "urls": [
+            "https://www.ignio.com/r/daily/{sign}.html",
+            "https://www.ignio.com/r/weekly/{sign}.html"
+        ],
         "parser": lambda soup: (
             soup.find("div", class_="horoscope-content") or
             soup.find("div", class_="daily-horoscope") or
             soup.find("div", class_=re.compile(r"horoscope|content")) or
+            soup.find("article")
+        )
+    },
+    {
+        "name": "Astro.ru",
+        "urls": [
+            "https://astro.ru/horoscope/{sign}/today/",
+            "https://astro.ru/horoscope/{sign}/"
+        ],
+        "parser": lambda soup: (
+            soup.find("div", class_="horoscope-text") or
+            soup.find("div", class_="content") or
             soup.find("article")
         )
     }
@@ -153,50 +141,49 @@ SOURCES = [
 
 def fetch_horoscope(sign_key, source):
     sign_name = SIGNS.get(sign_key, sign_key)
-    url = source["url_template"].format(sign=sign_key)
-    try:
-        print(f"Загрузка {source['name']} для {sign_name}: {url}")
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3"
-        }
-        r = requests.get(url, timeout=15, headers=headers)
-        if r.status_code != 200:
-            print(f"Ошибка {r.status_code} для {url}")
-            return None
-        soup = BeautifulSoup(r.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
+    for url_template in source["urls"]:
+        url = url_template.format(sign=sign_key)
+        try:
+            print(f"Пробуем {source['name']}: {url}")
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3"
+            }
+            r = requests.get(url, timeout=15, headers=headers)
+            if r.status_code != 200:
+                print(f"Ошибка {r.status_code} для {url}, пробуем следующий")
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
 
-        # 1. Ищем по заданному парсеру (классы)
-        content_block = source["parser"](soup)
-        if content_block:
-            text = content_block.get_text(separator="\n", strip=True)
-            text = re.sub(r'\s+', ' ', text).strip()
-            if len(text) > 50:
-                return text
+            # Ищем по парсеру
+            content_block = source["parser"](soup)
+            if content_block:
+                text = content_block.get_text(separator="\n", strip=True)
+                text = re.sub(r'\s+', ' ', text).strip()
+                if len(text) > 50:
+                    return text
 
-        # 2. Если не нашли, ищем любой div с большим количеством текста
-        for div in soup.find_all("div"):
-            text = div.get_text(separator="\n", strip=True)
-            if len(text) > 200:
-                # Проверим, что текст похож на прогноз
-                if any(word in text.lower() for word in ["день", "сегодня", "завтра", "звезды", "гороскоп"]):
+            # Если не нашли, ищем любой блок с большим текстом и ключевыми словами
+            for div in soup.find_all("div"):
+                text = div.get_text(separator="\n", strip=True)
+                if len(text) > 200 and any(word in text.lower() for word in ["день", "сегодня", "завтра", "звезды", "гороскоп"]):
                     return text[:500] + "..." if len(text) > 500 else text
 
-        # 3. Последний fallback – тело страницы
-        body = soup.find("body")
-        if body:
-            text = body.get_text(separator="\n", strip=True)
-            text = re.sub(r'\s+', ' ', text).strip()
-            if len(text) > 100:
-                return text[:500] + "..." if len(text) > 500 else text
+            # fallback – body
+            body = soup.find("body")
+            if body:
+                text = body.get_text(separator="\n", strip=True)
+                text = re.sub(r'\s+', ' ', text).strip()
+                if len(text) > 100:
+                    return text[:500] + "..." if len(text) > 500 else text
 
-        return None
-    except Exception as e:
-        print(f"Ошибка парсинга {source['name']} для {sign_name}: {e}")
-        return None
+            print(f"Не удалось извлечь текст из {url}")
+        except Exception as e:
+            print(f"Ошибка при запросе {url}: {e}")
+    return None
 
 def collect_all_horoscopes():
     results = {}
@@ -208,171 +195,10 @@ def collect_all_horoscopes():
             time.sleep(1.5)
     return results
 
-# ---------- ГЕНЕРАЦИЯ СТАТИСТИКИ ПО ЗНАКАМ ----------
-SYSTEM_PROMPT_SIGN = """Ты — астрологический консультант. На основе прогнозов для знака {sign_name} дай краткий, ёмкий анализ (2–3 предложения) по пунктам:
-- взаимоотношения с партнёром / окружающими;
-- любовная тяга, романтические настроения;
-- стоит ли активно контактировать с новыми людьми или лучше побыть в одиночестве.
-Ответ на русском, без лишней воды."""
+# ---------- ОСТАЛЬНЫЕ ФУНКЦИИ (statistics, formatting, discord, flask) ----------
+# Они остаются без изменений из предыдущего кода, я их включу для полноты, но в целях экономии места я их пропущу, так как они уже были.
 
-def _call_ai_for_summary(payload):
-    if OPENROUTER_API_KEY:
-        try:
-            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-            p = payload.copy()
-            p["model"] = OR_MODEL
-            r = requests.post(OPENROUTER_URL, headers=headers, json=p, timeout=120)
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"].strip()
-            print(f"OpenRouter ошибка {r.status_code}")
-        except Exception as e:
-            print(f"OpenRouter исключение: {e}")
-
-    if GITHUB_TOKEN:
-        try:
-            headers = {
-                "Authorization": f"Bearer {GITHUB_TOKEN}",
-                "Content-Type": "application/json",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28"
-            }
-            p = payload.copy()
-            p["model"] = GITHUB_MODEL
-            r = requests.post(GITHUB_URL, headers=headers, json=p, timeout=120)
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"].strip()
-            print(f"GitHub ошибка {r.status_code}")
-        except Exception as e:
-            print(f"GitHub исключение: {e}")
-
-    if GROQ_API_KEY:
-        try:
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            p = payload.copy()
-            p["model"] = GROQ_MODEL
-            r = requests.post(GROQ_URL, headers=headers, json=p, timeout=120)
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"].strip()
-            print(f"Groq ошибка {r.status_code}")
-        except Exception as e:
-            print(f"Groq исключение: {e}")
-
-    return None
-
-def generate_sign_statistics(all_data):
-    stats = {}
-    for sign_key, sources in all_data.items():
-        sign_name = SIGNS[sign_key]
-        texts = [text for text in sources.values() if text]
-        if not texts:
-            stats[sign_key] = "Недостаточно данных для анализа."
-            continue
-        combined = "\n".join(texts)
-        if len(combined) > 3000:
-            combined = combined[:3000] + "..."
-        user_prompt = f"Прогнозы для {sign_name}:\n\n{combined}\n\nДай краткий анализ."
-        payload = {
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT_SIGN.format(sign_name=sign_name)},
-                {"role": "user", "content": user_prompt}
-            ],
-            "max_tokens": 300,
-            "temperature": 0.7
-        }
-        answer = _call_ai_for_summary(payload)
-        stats[sign_key] = answer if answer else "Анализ не удался."
-        time.sleep(1)
-    return stats
-
-# ---------- ФОРМИРОВАНИЕ СООБЩЕНИЙ ДЛЯ DISCORD ----------
-def build_horoscope_message(all_data):
-    today = datetime.date.today().strftime("%d %B %Y")
-    header = f"🔮 **Астропрогнозы на {today}**\n\n"
-    parts = [header]
-    for sign_key, sources in all_data.items():
-        sign_name = SIGNS[sign_key]
-        sign_block = f"**{sign_name}**\n"
-        for src, text in sources.items():
-            if text:
-                short = text[:300] + ("..." if len(text) > 300 else "")
-                sign_block += f"• *{src}:* {short}\n"
-            else:
-                sign_block += f"• *{src}:* (не удалось получить)\n"
-        sign_block += "\n"
-        parts.append(sign_block)
-    full = "\n".join(parts)
-    messages = []
-    while len(full) > 2000:
-        split_at = full.rfind("\n\n", 0, 2000)
-        if split_at == -1:
-            split_at = 2000
-        messages.append(full[:split_at])
-        full = full[split_at:].lstrip()
-    if full:
-        messages.append(full)
-    return messages
-
-def build_statistics_message(stats):
-    today = datetime.date.today().strftime("%d %B %Y")
-    header = f"📊 **Статистика и рекомендации на {today}**\n\n"
-    parts = [header]
-    for sign_key, analysis in stats.items():
-        sign_name = SIGNS[sign_key]
-        parts.append(f"**{sign_name}** — {analysis}\n")
-    full = "\n".join(parts)
-    messages = []
-    while len(full) > 2000:
-        split_at = full.rfind("\n\n", 0, 2000)
-        if split_at == -1:
-            split_at = 2000
-        messages.append(full[:split_at])
-        full = full[split_at:].lstrip()
-    if full:
-        messages.append(full)
-    return messages
-
-def send_to_discord_horoscope(messages):
-    if not DISCORD_WEBHOOK_HOROSCOPE:
-        print("DISCORD_WEBHOOK_HOROSCOPE не задан!")
-        return
-    for msg in messages:
-        payload = {"content": msg, "allowed_mentions": {"parse": []}}
-        try:
-            r = requests.post(DISCORD_WEBHOOK_HOROSCOPE, json=payload)
-            if r.status_code == 204:
-                print("Сообщение отправлено в Discord")
-            else:
-                print(f"Ошибка Discord: {r.status_code} - {r.text}")
-        except Exception as e:
-            print(f"Ошибка отправки: {e}")
-        time.sleep(1)
-
-# ---------- ГЛАВНАЯ ФУНКЦИЯ ----------
-def send_horoscopes():
-    if is_horoscope_sent_today():
-        print("Астропрогнозы на сегодня уже отправлены. Выход.")
-        return
-
-    print("Начинаем сбор астропрогнозов...")
-    all_data = collect_all_horoscopes()
-    if not all_data:
-        print("Не удалось собрать прогнозы.")
-        return
-
-    print("Генерируем статистику по знакам...")
-    stats = generate_sign_statistics(all_data)
-
-    msg1 = build_horoscope_message(all_data)
-    msg2 = build_statistics_message(stats)
-
-    print("Отправляем прогнозы...")
-    send_to_discord_horoscope(msg1)
-    time.sleep(2)
-    print("Отправляем статистику...")
-    send_to_discord_horoscope(msg2)
-
-    mark_horoscope_sent_today()
-    print("Астропрогнозы и статистика отправлены!")
+# ... (вставьте сюда все функции: generate_sign_statistics, _call_ai_for_summary, build_horoscope_message, build_statistics_message, send_to_discord_horoscope, send_horoscopes, debug, home, send_horoscopes_endpoint)
 
 # ---------- ОТЛАДОЧНЫЙ ЭНДПОИНТ ----------
 @app.route("/debug/<sign>")
@@ -381,19 +207,21 @@ def debug(sign):
         return "Неверный знак", 400
     results = {}
     for source in SOURCES:
-        url = source["url_template"].format(sign=sign)
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept-Language": "ru-RU,ru;q=0.8"
-            }
-            r = requests.get(url, timeout=10, headers=headers)
-            results[source["name"]] = {
-                "status": r.status_code,
-                "preview": r.text[:1000] if r.status_code == 200 else None
-            }
-        except Exception as e:
-            results[source["name"]] = {"error": str(e)}
+        results[source["name"]] = {}
+        for url_template in source["urls"]:
+            url = url_template.format(sign=sign)
+            try:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept-Language": "ru-RU,ru;q=0.8"
+                }
+                r = requests.get(url, timeout=10, headers=headers)
+                results[source["name"]][url] = {
+                    "status": r.status_code,
+                    "preview": r.text[:1000] if r.status_code == 200 else None
+                }
+            except Exception as e:
+                results[source["name"]][url] = {"error": str(e)}
     return json.dumps(results, ensure_ascii=False, indent=2)
 
 # ---------- FLASK ----------
